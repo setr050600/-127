@@ -28,6 +28,8 @@ dp = Dispatcher(storage=MemoryStorage())
 def init_db():
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
+    
+    # Таблица расписания
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS schedule (
@@ -39,6 +41,17 @@ def init_db():
             subject TEXT,
             teacher TEXT,
             room TEXT
+        )
+    """
+    )
+    
+    # Таблица базы учителей
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS teachers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT UNIQUE,
+            teacher_name TEXT
         )
     """
     )
@@ -64,7 +77,7 @@ DAYS_RU = {
 }
 
 def format_date_display(date_str: str) -> str:
-    """Форматирует дату YYYY-MM-DD из БД в 'День_недели DD.MM.YY' (например, 'Вторник 17.10.26')"""
+    """Форматирует дату YYYY-MM-DD из БД в 'День_недели DD.MM.YY'"""
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
@@ -72,17 +85,30 @@ def format_date_display(date_str: str) -> str:
     weekday = DAYS_RU[dt.weekday()]
     return f"{weekday} {dt.strftime('%d.%m.%y')}"
 
-# --- Главное меню ---
+# --- Клавиатуры ---
 def get_main_keyboard():
     kb = [
-        [KeyboardButton(text="📅 Расписание на сегодня"), KeyboardButton(text="📆 Расписание на завтра")],
-        [KeyboardButton(text="🗓 Открыть календарь")],
-        [KeyboardButton(text="⚙️ Админ-панель")]
+        [KeyboardButton(text="📅 Посмотреть расписание"), KeyboardButton(text="⚙️ Админ-панель")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+# Список популярных классов (можно дополнять или брать из БД)
+CLASSES_LIST = ["5А", "5Б", "6А", "7А", "8А", "9А", "10А", "11А"]
+
+def get_classes_keyboard(action_prefix="class"):
+    kb = []
+    row = []
+    for c in CLASSES_LIST:
+        row.append(InlineKeyboardButton(text=c, callback_data=f"{action_prefix}:{c}"))
+        if len(row) == 3:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 # --- Генератор Инлайн-Календаря ---
-def generate_calendar_keyboard(year: int = None, month: int = None) -> InlineKeyboardMarkup:
+def generate_calendar_keyboard(class_name: str, year: int = None, month: int = None) -> InlineKeyboardMarkup:
     now = datetime.now()
     if not year:
         year = now.year
@@ -92,7 +118,7 @@ def generate_calendar_keyboard(year: int = None, month: int = None) -> InlineKey
     keyboard = []
     
     header_button = InlineKeyboardButton(
-        text=f"📅 {MONTHS_RU[month]} {year}",
+        text=f"📅 {MONTHS_RU[month]} {year} ({class_name})",
         callback_data="ignore"
     )
     keyboard.append([header_button])
@@ -108,7 +134,7 @@ def generate_calendar_keyboard(year: int = None, month: int = None) -> InlineKey
                 row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
             else:
                 date_str = f"{year}-{month:02d}-{day:02d}"
-                row.append(InlineKeyboardButton(text=str(day), callback_data=f"cal_date:{date_str}"))
+                row.append(InlineKeyboardButton(text=str(day), callback_data=f"cal_date:{class_name}:{date_str}"))
         keyboard.append(row)
 
     prev_m = month - 1 if month > 1 else 12
@@ -117,21 +143,30 @@ def generate_calendar_keyboard(year: int = None, month: int = None) -> InlineKey
     next_y = year if month < 12 else year + 1
 
     nav_row = [
-        InlineKeyboardButton(text="⬅️", callback_data=f"cal_nav:{prev_y}:{prev_m}"),
+        InlineKeyboardButton(text="⬅️", callback_data=f"cal_nav:{class_name}:{prev_y}:{prev_m}"),
         InlineKeyboardButton(text="❌ Закрыть", callback_data="cal_close"),
-        InlineKeyboardButton(text="➡️", callback_data=f"cal_nav:{next_y}:{next_m}")
+        InlineKeyboardButton(text="➡️", callback_data=f"cal_nav:{class_name}:{next_y}:{next_m}")
     ]
     keyboard.append(nav_row)
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-# --- Получение расписания из БД для всех классов (или можно фильтровать) ---
-def get_schedule_by_date(date_str: str) -> str:
+# --- Работа с базой учителей ---
+def get_teacher_for_subject(subject: str) -> str:
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT teacher_name FROM teachers WHERE LOWER(subject) = LOWER(?)", (subject.strip(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
+# --- Получение расписания из БД ---
+def get_schedule_by_date_and_class(date_str: str, class_name: str) -> str:
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT class_name, lesson_num, time_slot, subject, teacher, room FROM schedule WHERE date = ? ORDER BY class_name, lesson_num",
-        (date_str,)
+        "SELECT lesson_num, time_slot, subject, teacher, room FROM schedule WHERE date = ? AND class_name = ? ORDER BY lesson_num",
+        (date_str, class_name)
     )
     rows = cursor.fetchall()
     conn.close()
@@ -139,31 +174,29 @@ def get_schedule_by_date(date_str: str) -> str:
     formatted_header_date = format_date_display(date_str)
 
     if not rows:
-        return f"📌 **Расписание на {formatted_header_date}:**\n\nУроков нет 🎉"
+        return f"📌 **Расписание для класса {class_name} на {formatted_header_date}:**\n\nУроков нет 🎉"
 
-    text = f"📌 **Расписание на {formatted_header_date}:**\n\n"
-    current_class = None
-    
+    text = f"📌 **Расписание для класса {class_name} на {formatted_header_date}:**\n\n"
     for row in rows:
-        class_name, num, time_slot, subject, teacher, room = row
-        if class_name != current_class:
-            current_class = class_name
-            text += f"🏫 **Класс: {current_class}**\n"
-            
-        text += f"  {num}. {time_slot} — {subject}\n"
+        num, time_slot, subject, teacher, room = row
+        text += f"**{num}. {time_slot}** — {subject}\n"
         if teacher:
-            text += f"     👤 {teacher}\n"
+            text += f"   👤 Учитель: {teacher}\n"
         if room:
-            text += f"     🚪 Каб.: {room}\n"
+            text += f"   🚪 Каб.: {room}\n"
         text += "\n"
-        
     return text
 
-# --- FSM Мастер для массового добавления с классом ---
+# --- FSM Мастер для добавления расписания ---
 class AddScheduleWizard(StatesGroup):
     class_name = State()
     date = State()
     lessons_text = State()
+
+# --- FSM Мастер для добавления учителя ---
+class AddTeacherWizard(StatesGroup):
+    subject = State()
+    teacher_name = State()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -172,35 +205,32 @@ async def cmd_start(message: types.Message):
         reply_markup=get_main_keyboard()
     )
 
-@dp.message(F.text == "📅 Расписание на сегодня")
-async def today_schedule(message: types.Message):
-    today = datetime.now().strftime("%Y-%m-%d")
-    await message.answer(get_schedule_by_date(today), parse_mode="Markdown")
+@dp.message(F.text == "📅 Посмотреть расписание")
+async def choose_class_for_schedule(message: types.Message):
+    await message.answer("Сначала выберите ваш класс:", reply_markup=get_classes_keyboard("user_class"))
 
-@dp.message(F.text == "📆 Расписание на завтра")
-async def tomorrow_schedule(message: types.Message):
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    await message.answer(get_schedule_by_date(tomorrow), parse_mode="Markdown")
-
-@dp.message(F.text == "🗓 Открыть календарь")
-async def open_calendar(message: types.Message):
-    await message.answer(
-        "Выберите интересующий день в календаре:",
-        reply_markup=generate_calendar_keyboard()
+@dp.callback_query(F.data.startswith("user_class:"))
+async def process_user_class(callback: types.CallbackQuery):
+    class_name = callback.data.split(":")[1]
+    await callback.message.edit_text(
+        f"Класс выбран: **{class_name}**.\nТеперь выберите день в календаре:",
+        reply_markup=generate_calendar_keyboard(class_name),
+        parse_mode="Markdown"
     )
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("cal_date:"))
 async def process_calendar_date(callback: types.CallbackQuery):
-    date_str = callback.data.split(":")[1]
-    schedule_text = get_schedule_by_date(date_str)
+    _, class_name, date_str = callback.data.split(":")
+    schedule_text = get_schedule_by_date_and_class(date_str, class_name)
     await callback.message.answer(schedule_text, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("cal_nav:"))
 async def process_calendar_nav(callback: types.CallbackQuery):
-    _, year, month = callback.data.split(":")
+    _, class_name, year, month = callback.data.split(":")
     await callback.message.edit_reply_markup(
-        reply_markup=generate_calendar_keyboard(int(year), int(month))
+        reply_markup=generate_calendar_keyboard(class_name, int(year), int(month))
     )
     await callback.answer()
 
@@ -213,30 +243,84 @@ async def process_calendar_close(callback: types.CallbackQuery):
 async def process_ignore(callback: types.CallbackQuery):
     await callback.answer()
 
+# --- Админ-панель ---
 @dp.message(F.text == "⚙️ Админ-панель")
 async def admin_panel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ У вас нет прав администратора.")
         return
     await message.answer(
-        "Команды администратора:\n➕ `/set` — Добавить расписание для класса",
+        "Панель администратора:\n\n"
+        "➕ `/set` — Добавить расписание для класса\n"
+        "👩‍🏫 `/addteacher` — Добавить учителя для предмета в базу\n"
+        "📋 `/teachers` — Посмотреть список сохраненных учителей",
         parse_mode="Markdown"
     )
+
+@dp.message(Command("teachers"))
+async def list_teachers(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT subject, teacher_name FROM teachers")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("📚 База учителей пуста. Добавьте учителей через `/addteacher`", parse_mode="Markdown")
+        return
+
+    text = "📚 **База учителей:**\n\n"
+    for subj, teach in rows:
+        text += f"• **{subj}** — {teach}\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("addteacher"))
+async def start_teacher_wizard(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AddTeacherWizard.subject)
+    await message.answer("Введите название предмета (например, `Математика`):")
+
+@dp.message(AddTeacherWizard.subject)
+async def process_teacher_subject(message: types.Message, state: FSMContext):
+    await state.update_data(subject=message.text.strip())
+    await state.set_state(AddTeacherWizard.teacher_name)
+    await message.answer("Введите ФИО учителя для этого предмета (например, `Иванов И.И.`):")
+
+@dp.message(AddTeacherWizard.teacher_name)
+async def process_teacher_name(message: types.Message, state: FSMContext):
+    teacher_name = message.text.strip()
+    data = await state.get_data()
+    subject = data["subject"]
+
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO teachers (subject, teacher_name) VALUES (?, ?)",
+        (subject, teacher_name)
+    )
+    conn.commit()
+    conn.close()
+    await state.clear()
+
+    await message.answer(f"✅ Учитель **{teacher_name}** успешно закреплен за предметом **{subject}**!", parse_mode="Markdown")
 
 @dp.message(Command("set"))
 async def start_wizard(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Доступ запрещен.")
         return
-    await state.set_state(AddScheduleWizard.class_name)
-    await message.answer("Введи название класса (например, `10А` или `8Б`):", parse_mode="Markdown")
+    await message.answer("Выберите класс, для которого хотите добавить расписание:", reply_markup=get_classes_keyboard("admin_class"))
 
-@dp.message(AddScheduleWizard.class_name)
-async def process_wizard_class(message: types.Message, state: FSMContext):
-    class_name = message.text.strip()
+@dp.callback_query(F.data.startswith("admin_class:"))
+async def process_admin_class(callback: types.CallbackQuery, state: FSMContext):
+    class_name = callback.data.split(":")[1]
     await state.update_data(class_name=class_name)
+    await state.message.edit_text(f"Выбран класс: **{class_name}**.\nТеперь введите дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):", parse_mode="Markdown")
     await state.set_state(AddScheduleWizard.date)
-    await message.answer("Теперь введи дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):", parse_mode="Markdown")
+    await callback.answer()
 
 @dp.message(AddScheduleWizard.date)
 async def process_wizard_date(message: types.Message, state: FSMContext):
@@ -252,10 +336,12 @@ async def process_wizard_date(message: types.Message, state: FSMContext):
     await state.set_state(AddScheduleWizard.lessons_text)
     await message.answer(
         "Теперь отправь список уроков **одним сообщением**.\n"
-        "Каждый урок с новой строки в формате:\n"
+        "Формат строки:\n"
+        "`Номер | Время | Предмет | Кабинет` *(учитель подтянется сам из базы!)*\n"
+        "Или можете указать учителя вручную:\n"
         "`Номер | Время | Предмет | Учитель | Кабинет`\n\n"
         "Пример:\n"
-        "1 | 08:30-09:15 | Математика | Иванов И.И. | 302\n"
+        "1 | 08:30-09:15 | Математика | 302\n"
         "2 | 09:25-10:10 | Физика | Петров П.П. | 405",
         parse_mode="Markdown"
     )
@@ -270,7 +356,6 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
-    # Очищаем старое расписание именно для этого класса на этот день
     cursor.execute("DELETE FROM schedule WHERE date = ? AND class_name = ?", (db_date, class_name))
 
     added_count = 0
@@ -281,8 +366,23 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
                 lesson_num = int(parts[0])
                 time_slot = parts[1]
                 subject = parts[2]
-                teacher = parts[3] if len(parts) > 3 else ""
-                room = parts[4] if len(parts) > 4 else ""
+                
+                # Проверяем, указан ли учитель или подтягивать из базы
+                if len(parts) >= 5:
+                    teacher = parts[3]
+                    room = parts[4]
+                elif len(parts) == 4:
+                    # Может быть либо учитель, либо кабинет. Проверим базу учителей.
+                    auto_teacher = get_teacher_for_subject(subject)
+                    if auto_teacher:
+                        teacher = auto_teacher
+                        room = parts[3]
+                    else:
+                        teacher = parts[3]
+                        room = ""
+                else:
+                    teacher = get_teacher_for_subject(subject)
+                    room = ""
 
                 cursor.execute(
                     "INSERT INTO schedule (date, class_name, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?, ?)",
