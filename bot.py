@@ -1,8 +1,8 @@
-
 import asyncio
 import os
 import sqlite3
 import calendar
+import threading
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -276,22 +276,20 @@ async def process_wizard_room(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Урок по предмету **{data['subject']}** на дату `{data['date']}` успешно добавлен!", parse_mode="Markdown")
 
+# --- Веб-сервер в потоке и запуск бота ---
+def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+    port = int(os.getenv("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
 
-import threading 
-from aiohttp import web
-def run_web_server(): 
-    app = web.Application() 
-    app.router.add_get("/", lambda r: web.Response(text="Bot is running!")) 
-port = int(os.getenv("PORT", 10000))
-web.run_app(app, host="0.0.0.0", port=port)
-async def main(): # Запускаем веб-сервер в фоновом потоке, чтобы Render увидел порт 
-    server_thread = threading.Thread(target=run_web_server, daemon=True) 
-    server_thread.start() 
+async def main():
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
     print("Веб-сервер запущен в фоне...")
 
-print("Бот запущен...")
-await dp.start_polling(bot)
+    print("Бот запущен...")
+    await dp.start_polling(bot)
 
-if name == "main": 
+if __name__ == "__main__":
     asyncio.run(main())
-    
