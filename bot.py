@@ -19,7 +19,7 @@ from aiogram.types import (
 from aiohttp import web
 
 TOKEN = os.getenv("TOKEN", "8970467114:AAF6gGr4AIaQtd529KaMNJxYCJiV31FbWLw")
-ADMIN_IDS = [88405805]  # Укажите ваш Telegram ID
+ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
