@@ -24,7 +24,7 @@ ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-
+# --- База данных ---
 def init_db():
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
@@ -65,7 +65,6 @@ def init_db():
         )
     """
     )
-    # Добавим базовые классы, если таблица пустая
     cursor.execute("SELECT COUNT(*) FROM classes")
     if cursor.fetchone()[0] == 0:
         default_classes = ["5А", "5Б", "6А", "7А", "8А", "9А", "10А", "11А"]
@@ -273,10 +272,11 @@ async def admin_panel(message: types.Message):
         return
     await message.answer(
         "Панель администратора:\n\n"
-        "🏫 `/addclass` — Добавить новый класс в список\n"
+        "🏫 `/addclass` — Добавить новый класс\n"
         "➕ `/set` — Добавить расписание для класса\n"
-        "👩‍🏫 `/addteacher` — Добавить учителя для предмета\n"
-        "📋 `/teachers` — Посмотреть список учителей",
+        "👩‍🏫 `/addteacher` — Добавить учителя\n"
+        "🗑 `/delteacher` — Удалить учителя\n"
+        "📋 `/teachers` — Список учителей",
         parse_mode="Markdown"
     )
 
@@ -319,6 +319,38 @@ async def list_teachers(message: types.Message):
     for subj, teach in rows:
         text += f"• **{subj}** — {teach}\n"
     await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("delteacher"))
+async def delete_teacher_menu(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, subject, teacher_name FROM teachers")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("📚 База учителей пуста, некого удалять.", parse_mode="Markdown")
+        return
+
+    kb = []
+    for t_id, subj, teach in rows:
+        kb.append([InlineKeyboardButton(text=f"❌ {subj} ({teach})", callback_data=f"del_teach:{t_id}")])
+
+    await message.answer("Выберите учителя, которого хотите удалить:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("del_teach:"))
+async def process_delete_teacher(callback: types.CallbackQuery):
+    t_id = callback.data.split(":")[1]
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM teachers WHERE id = ?", (t_id,))
+    conn.commit()
+    conn.close()
+
+    await callback.answer("Учитель успешно удален!")
+    await callback.message.edit_text("✅ Учитель успешно удален из базы данных.")
 
 @dp.message(Command("addteacher"))
 async def start_teacher_wizard(message: types.Message, state: FSMContext):
@@ -363,10 +395,7 @@ async def process_admin_class(callback: types.CallbackQuery, state: FSMContext):
     class_name = callback.data.split(":")[1]
     await state.update_data(class_name=class_name)
     await state.set_state(AddScheduleWizard.date)
-    
-    # Обязательно отвечаем на callback, чтобы кнопка не зависала крутиться
     await callback.answer()
-    
     await callback.message.edit_text(
         f"Выбран класс: **{class_name}**.\nТеперь введите дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):",
         parse_mode="Markdown"
@@ -406,60 +435,4 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
-    cursor.execute("DELETE FROM schedule WHERE date = ? AND class_name = ?", (db_date, class_name))
-
-    added_count = 0
-    for line in lines:
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) >= 3:
-            try:
-                lesson_num = int(parts[0])
-                time_slot = parts[1]
-                subject = parts[2]
-                
-                if len(parts) >= 5:
-                    teacher = parts[3]
-                    room = parts[4]
-                elif len(parts) == 4:
-                    auto_teacher = get_teacher_for_subject(subject)
-                    if auto_teacher:
-                        teacher = auto_teacher
-                        room = parts[3]
-                    else:
-                        teacher = parts[3]
-                        room = ""
-                else:
-                    teacher = get_teacher_for_subject(subject)
-                    room = ""
-
-                cursor.execute(
-                    "INSERT INTO schedule (date, class_name, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (db_date, class_name, lesson_num, time_slot, subject, teacher, room)
-                )
-                added_count += 1
-            except ValueError:
-                continue
-
-    conn.commit()
-    conn.close()
-    await state.clear()
-
-    display_date = format_date_display(db_date)
-    await message.answer(f"✅ Успешно добавлено уроков ({added_count}) для класса **{class_name}** на дату: **{display_date}**!", parse_mode="Markdown")
-
-def run_web_server():
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
-    port = int(os.getenv("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
-
-async def main():
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
-    print("Веб-сервер запущен в фоне...")
-
-    print("Бот запущен...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    cursor.execute("DELETE FROM schedule
