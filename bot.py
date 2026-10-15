@@ -24,7 +24,7 @@ ADMIN_IDS = [88405805]  # Укажите ваш Telegram ID
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- База данных ---
+
 def init_db():
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
