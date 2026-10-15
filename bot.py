@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import sqlite3
@@ -62,11 +63,14 @@ DAYS_RU = {
     6: "Воскресенье"
 }
 
-def format_date_with_weekday(date_str: str) -> str:
-    """Форматирует дату YYYY-MM-DD в 'День_недели DD.MM' (например, 'Вторник 13.10')"""
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
+def format_date_display(date_str: str) -> str:
+    """Форматирует дату YYYY-MM-DD из БД в 'День_недели DD.MM.YY' (например, 'Вторник 17.10.26')"""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return date_str
     weekday = DAYS_RU[dt.weekday()]
-    return f"{weekday} {dt.strftime('%d.%m')}"
+    return f"{weekday} {dt.strftime('%d.%m.%y')}"
 
 # --- Главное меню ---
 def get_main_keyboard():
@@ -132,7 +136,7 @@ def get_schedule_by_date(date_str: str) -> str:
     rows = cursor.fetchall()
     conn.close()
 
-    formatted_header_date = format_date_with_weekday(date_str)
+    formatted_header_date = format_date_display(date_str)
 
     if not rows:
         return f"📌 **Расписание на {formatted_header_date}:**\n\nУроков нет 🎉"
@@ -148,14 +152,10 @@ def get_schedule_by_date(date_str: str) -> str:
         text += "\n"
     return text
 
-# --- FSM Мастер ---
-class AddLessonWizard(StatesGroup):
+# --- FSM Мастер для массового добавления ---
+class AddScheduleWizard(StatesGroup):
     date = State()
-    lesson_num = State()
-    time_slot = State()
-    subject = State()
-    teacher = State()
-    room = State()
+    lessons_text = State()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -211,7 +211,7 @@ async def admin_panel(message: types.Message):
         await message.answer("❌ У вас нет прав администратора.")
         return
     await message.answer(
-        "Команды администратора:\n➕ `/set` — Добавить урок по шагам",
+        "Команды администратора:\n➕ `/set` — Добавить расписание на день одним сообщением",
         parse_mode="Markdown"
     )
 
@@ -220,61 +220,69 @@ async def start_wizard(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Доступ запрещен.")
         return
-    await state.set_state(AddLessonWizard.date)
-    await message.answer("Введи дату урока в формате **YYYY-MM-DD** (например, `2026-10-13`):", parse_mode="Markdown")
+    await state.set_state(AddScheduleWizard.date)
+    await message.answer("Введи дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):", parse_mode="Markdown")
 
-@dp.message(AddLessonWizard.date)
+@dp.message(AddScheduleWizard.date)
 async def process_wizard_date(message: types.Message, state: FSMContext):
-    await state.update_data(date=message.text.strip())
-    await state.set_state(AddLessonWizard.lesson_num)
-    await message.answer("Введи номер урока (цифра, например: `1`):")
+    raw_date = message.text.strip()
+    try:
+        # Конвертируем из DD.MM.YY в YYYY-MM-DD для базы данных
+        dt = datetime.strptime(raw_date, "%d.%m.%y")
+        db_date = dt.strftime("%Y-%m-%d")
+    except ValueError:
+        await message.answer("❌ Неверный формат даты! Введите в формате **ДД.ММ.ГГ** (например, `17.10.26`):", parse_mode="Markdown")
+        return
 
-@dp.message(AddLessonWizard.lesson_num)
-async def process_wizard_num(message: types.Message, state: FSMContext):
-    await state.update_data(lesson_num=int(message.text.strip()))
-    await state.set_state(AddLessonWizard.time_slot)
-    await message.answer("Введи время урока (например, `08:30 - 09:15`):")
+    await state.update_data(date=db_date)
+    await state.set_state(AddScheduleWizard.lessons_text)
+    await message.answer(
+        "Теперь отправь список уроков **одним сообщением**.\n"
+        "Каждый урок с новой строки в формате:\n"
+        "`Номер | Время | Предмет | Учитель | Кабинет`\n\n"
+        "Пример:\n"
+        "1 | 08:30-09:15 | Математика | Иванов И.И. | 302\n"
+        "2 | 09:25-10:10 | Физика | Петров П.П. | 405",
+        parse_mode="Markdown"
+    )
 
-@dp.message(AddLessonWizard.time_slot)
-async def process_wizard_time(message: types.Message, state: FSMContext):
-    await state.update_data(time_slot=message.text.strip())
-    await state.set_state(AddLessonWizard.subject)
-    await message.answer("Введи название предмета (например, `Математика`):")
-
-@dp.message(AddLessonWizard.subject)
-async def process_wizard_subject(message: types.Message, state: FSMContext):
-    await state.update_data(subject=message.text.strip())
-    await state.set_state(AddLessonWizard.teacher)
-    await message.answer("Введи имя учителя (или пропусти, отправив `-`):")
-
-@dp.message(AddLessonWizard.teacher)
-async def process_wizard_teacher(message: types.Message, state: FSMContext):
-    teacher = message.text.strip()
-    if teacher == "-":
-        teacher = ""
-    await state.update_data(teacher=teacher)
-    await state.set_state(AddLessonWizard.room)
-    await message.answer("Введи кабинет (или пропусти, отправив `-`):")
-
-@dp.message(AddLessonWizard.room)
-async def process_wizard_room(message: types.Message, state: FSMContext):
-    room = message.text.strip()
-    if room == "-":
-        room = ""
-    
+@dp.message(AddScheduleWizard.lessons_text)
+async def process_wizard_lessons(message: types.Message, state: FSMContext):
     data = await state.get_data()
+    db_date = data["date"]
     
+    lines = message.text.strip().split("\n")
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO schedule (date, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?)",
-        (data["date"], data["lesson_num"], data["time_slot"], data["subject"], data["teacher"], room)
-    )
+    
+    # Очищаем старое расписание на этот день перед записью нового
+    cursor.execute("DELETE FROM schedule WHERE date = ?", (db_date,))
+
+    added_count = 0
+    for line in lines:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3:
+            try:
+                lesson_num = int(parts[0])
+                time_slot = parts[1]
+                subject = parts[2]
+                teacher = parts[3] if len(parts) > 3 else ""
+                room = parts[4] if len(parts) > 4 else ""
+
+                cursor.execute(
+                    "INSERT INTO schedule (date, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?)",
+                    (db_date, lesson_num, time_slot, subject, teacher, room)
+                )
+                added_count += 1
+            except ValueError:
+                continue
+
     conn.commit()
     conn.close()
-
     await state.clear()
-    await message.answer(f"✅ Урок по предмету **{data['subject']}** на дату `{data['date']}` успешно добавлен!", parse_mode="Markdown")
+
+    display_date = format_date_display(db_date)
+    await message.answer(f"✅ Успешно добавлено уроков ({added_count}) на дату: **{display_date}**!", parse_mode="Markdown")
 
 # --- Веб-сервер в потоке и запуск бота ---
 def run_web_server():
