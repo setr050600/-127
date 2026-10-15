@@ -19,7 +19,7 @@ from aiogram.types import (
 from aiohttp import web
 
 TOKEN = os.getenv("TOKEN", "8970467114:AAF6gGr4AIaQtd529KaMNJxYCJiV31FbWLw")
-ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
+ADMIN_IDS = [88405805]  # Укажите ваш Telegram ID
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -55,6 +55,23 @@ def init_db():
         )
     """
     )
+
+    # Таблица классов
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_name TEXT UNIQUE
+        )
+    """
+    )
+    # Добавим базовые классы, если таблица пустая
+    cursor.execute("SELECT COUNT(*) FROM classes")
+    if cursor.fetchone()[0] == 0:
+        default_classes = ["5А", "5Б", "6А", "7А", "8А", "9А", "10А", "11А"]
+        for c in default_classes:
+            cursor.execute("INSERT OR IGNORE INTO classes (class_name) VALUES (?)", (c,))
+
     conn.commit()
     conn.close()
 
@@ -77,7 +94,6 @@ DAYS_RU = {
 }
 
 def format_date_display(date_str: str) -> str:
-    """Форматирует дату YYYY-MM-DD из БД в 'День_недели DD.MM.YY'"""
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
@@ -92,13 +108,19 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# Список популярных классов (можно дополнять или брать из БД)
-CLASSES_LIST = ["5А", "5Б", "6А", "7А", "8А", "9А", "10А", "11А"]
+def get_classes_from_db():
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT class_name FROM classes ORDER BY class_name")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def get_classes_keyboard(action_prefix="class"):
+    classes_list = get_classes_from_db()
     kb = []
     row = []
-    for c in CLASSES_LIST:
+    for c in classes_list:
         row.append(InlineKeyboardButton(text=c, callback_data=f"{action_prefix}:{c}"))
         if len(row) == 3:
             kb.append(row)
@@ -151,7 +173,6 @@ def generate_calendar_keyboard(class_name: str, year: int = None, month: int = N
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-# --- Работа с базой учителей ---
 def get_teacher_for_subject(subject: str) -> str:
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
@@ -160,7 +181,6 @@ def get_teacher_for_subject(subject: str) -> str:
     conn.close()
     return row[0] if row else ""
 
-# --- Получение расписания из БД ---
 def get_schedule_by_date_and_class(date_str: str, class_name: str) -> str:
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
@@ -187,16 +207,18 @@ def get_schedule_by_date_and_class(date_str: str, class_name: str) -> str:
         text += "\n"
     return text
 
-# --- FSM Мастер для добавления расписания ---
+# --- FSM Мастеры ---
 class AddScheduleWizard(StatesGroup):
     class_name = State()
     date = State()
     lessons_text = State()
 
-# --- FSM Мастер для добавления учителя ---
 class AddTeacherWizard(StatesGroup):
     subject = State()
     teacher_name = State()
+
+class AddClassWizard(StatesGroup):
+    class_name = State()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -251,11 +273,33 @@ async def admin_panel(message: types.Message):
         return
     await message.answer(
         "Панель администратора:\n\n"
+        "🏫 `/addclass` — Добавить новый класс в список\n"
         "➕ `/set` — Добавить расписание для класса\n"
-        "👩‍🏫 `/addteacher` — Добавить учителя для предмета в базу\n"
-        "📋 `/teachers` — Посмотреть список сохраненных учителей",
+        "👩‍🏫 `/addteacher` — Добавить учителя для предмета\n"
+        "📋 `/teachers` — Посмотреть список учителей",
         parse_mode="Markdown"
     )
+
+@dp.message(Command("addclass"))
+async def start_class_wizard(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AddClassWizard.class_name)
+    await message.answer("Введите название нового класса (например, `10Б` или `8В`):")
+
+@dp.message(AddClassWizard.class_name)
+async def process_new_class(message: types.Message, state: FSMContext):
+    class_name = message.text.strip()
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO classes (class_name) VALUES (?)", (class_name,))
+        conn.commit()
+        await message.answer(f"✅ Класс **{class_name}** успешно добавлен в базу!", parse_mode="Markdown")
+    except sqlite3.IntegrityError:
+        await message.answer(f"⚠️ Класс **{class_name}** уже существует в базе.", parse_mode="Markdown")
+    conn.close()
+    await state.clear()
 
 @dp.message(Command("teachers"))
 async def list_teachers(message: types.Message):
@@ -268,7 +312,7 @@ async def list_teachers(message: types.Message):
     conn.close()
 
     if not rows:
-        await message.answer("📚 База учителей пуста. Добавьте учителей через `/addteacher`", parse_mode="Markdown")
+        await message.answer("📚 База учителей пуста.", parse_mode="Markdown")
         return
 
     text = "📚 **База учителей:**\n\n"
@@ -305,22 +349,28 @@ async def process_teacher_name(message: types.Message, state: FSMContext):
     conn.close()
     await state.clear()
 
-    await message.answer(f"✅ Учитель **{teacher_name}** успешно закреплен за предметом **{subject}**!", parse_mode="Markdown")
+    await message.answer(f"✅ Учитель **{teacher_name}** закреплен за предметом **{subject}**!", parse_mode="Markdown")
 
 @dp.message(Command("set"))
 async def start_wizard(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Доступ запрещен.")
         return
-    await message.answer("Выберите класс, для которого хотите добавить расписание:", reply_markup=get_classes_keyboard("admin_class"))
+    await message.answer("Выберите класс для добавления расписания:", reply_markup=get_classes_keyboard("admin_class"))
 
 @dp.callback_query(F.data.startswith("admin_class:"))
 async def process_admin_class(callback: types.CallbackQuery, state: FSMContext):
     class_name = callback.data.split(":")[1]
     await state.update_data(class_name=class_name)
-    await state.message.edit_text(f"Выбран класс: **{class_name}**.\nТеперь введите дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):", parse_mode="Markdown")
     await state.set_state(AddScheduleWizard.date)
+    
+    # Обязательно отвечаем на callback, чтобы кнопка не зависала крутиться
     await callback.answer()
+    
+    await callback.message.edit_text(
+        f"Выбран класс: **{class_name}**.\nТеперь введите дату в формате **ДД.ММ.ГГ** (например, `17.10.26`):",
+        parse_mode="Markdown"
+    )
 
 @dp.message(AddScheduleWizard.date)
 async def process_wizard_date(message: types.Message, state: FSMContext):
@@ -337,8 +387,8 @@ async def process_wizard_date(message: types.Message, state: FSMContext):
     await message.answer(
         "Теперь отправь список уроков **одним сообщением**.\n"
         "Формат строки:\n"
-        "`Номер | Время | Предмет | Кабинет` *(учитель подтянется сам из базы!)*\n"
-        "Или можете указать учителя вручную:\n"
+        "`Номер | Время | Предмет | Кабинет` *(учитель подтянется из базы)*\n"
+        "Или с учителем вручную:\n"
         "`Номер | Время | Предмет | Учитель | Кабинет`\n\n"
         "Пример:\n"
         "1 | 08:30-09:15 | Математика | 302\n"
@@ -367,12 +417,10 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
                 time_slot = parts[1]
                 subject = parts[2]
                 
-                # Проверяем, указан ли учитель или подтягивать из базы
                 if len(parts) >= 5:
                     teacher = parts[3]
                     room = parts[4]
                 elif len(parts) == 4:
-                    # Может быть либо учитель, либо кабинет. Проверим базу учителей.
                     auto_teacher = get_teacher_for_subject(subject)
                     if auto_teacher:
                         teacher = auto_teacher
@@ -399,7 +447,6 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     display_date = format_date_display(db_date)
     await message.answer(f"✅ Успешно добавлено уроков ({added_count}) для класса **{class_name}** на дату: **{display_date}**!", parse_mode="Markdown")
 
-# --- Веб-сервер в потоке и запуск бота ---
 def run_web_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
