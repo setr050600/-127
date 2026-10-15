@@ -279,8 +279,19 @@ async def process_wizard_room(message: types.Message, state: FSMContext):
 
 import threading 
 from aiohttp import web
-def run_web_server(): app = web.Application() app.router.add_get("/", lambda r: web.Response(text="Bot is running!")) port = int(os.getenv("PORT", 10000)) web.run_app(app, host="0.0.0.0", port=port)
-async def main(): # Запускаем веб-сервер в фоновом потоке, чтобы Render мгновенно увидел открытый порт server_thread = threading.Thread(target=run_web_server, daemon=True) server_thread.start() print("Веб-сервер запущен в фоне...")
-    print("Бот запущен...")
+def run_web_server(): 
+    app = web.Application() 
+    app.router.add_get("/", lambda r: web.Response(text="Bot is running!")) 
+port = int(os.getenv("PORT", 10000))
+web.run_app(app, host="0.0.0.0", port=port)
+async def main(): # Запускаем веб-сервер в фоновом потоке, чтобы Render увидел порт 
+    server_thread = threading.Thread(target=run_web_server, daemon=True) 
+    server_thread.start() 
+    print("Веб-сервер запущен в фоне...")
+
+print("Бот запущен...")
 await dp.start_polling(bot)
-if name == "main": asyncio.run(main())
+
+if name == "main": 
+    asyncio.run(main())
+    
