@@ -2,7 +2,6 @@ import asyncio
 import os
 import sqlite3
 import calendar
-import threading
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -32,8 +31,6 @@ def init_db():
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
-    
-    # Таблица расписания
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS schedule (
@@ -49,7 +46,6 @@ def init_db():
     """
     )
     
-    # Таблица базы учителей
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS teachers (
@@ -60,7 +56,6 @@ def init_db():
     """
     )
 
-    # Таблица классов
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS classes (
@@ -121,7 +116,6 @@ def get_classes_from_db():
     conn.close()
     return [row[0] for row in rows]
 
-# Генератор клавиатуры классов с пагинацией (по 12 штук на странице)
 def get_classes_keyboard(action_prefix="class", page: int = 0):
     classes_list = get_classes_from_db()
     PER_PAGE = 12
@@ -158,7 +152,6 @@ def get_classes_keyboard(action_prefix="class", page: int = 0):
 
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- Генератор Инлайн-Календаря ---
 def generate_calendar_keyboard(class_name: str, year: int = None, month: int = None) -> InlineKeyboardMarkup:
     now = datetime.now()
     if not year:
@@ -551,7 +544,6 @@ async def process_wizard_date(message: types.Message, state: FSMContext):
 @dp.message(AddScheduleWizard.lessons_text)
 async def process_wizard_lessons(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    class_name = data["data"] if "data" in data else data["class_name"] # страховка
     class_name = data["class_name"]
     db_date = data["date"]
     
@@ -600,17 +592,21 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     display_date = format_date_display(db_date)
     await message.answer(f"✅ Успешно добавлено уроков ({added_count}) для класса **{class_name}** на дату: **{display_date}**!", parse_mode="Markdown")
 
-def run_web_server():
+# --- Исправленный запуск с асинхронным веб-сервером ---
+async def web_server_runner():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.getenv("PORT", 10000))
-    web.run_app(app, host="0.0.0.0", port=port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер запущен на порту {port}...")
 
 async def main():
-    server_thread = threading.Thread(target=run_web_server, daemon=True)
-    server_thread.start()
-    print("Веб-сервер запущен в фоне...")
-
+    # Запускаем веб-сервер в том же asyncio-цикле, чтобы Render сразу видел активность
+    await web_server_runner()
+    
     print("Бот запущен...")
     await dp.start_polling(bot)
 
