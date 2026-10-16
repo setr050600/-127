@@ -5,6 +5,8 @@ Telegram-бот «Школьное расписание» (aiogram 3, Python 3.1
   • подтягивает расписание из Google Таблицы (автоматически каждые N минут
     и по команде /sync) — админ просто правит таблицу, бот подхватывает;
   • админ добавляет / удаляет классы прямо в боте (/admin);
+  • админ может добавлять уроки вручную (/admin → «Расписание вручную»);
+    такие уроки не стираются при обновлении из таблицы;
   • ученик выбирает класс, открывает календарь, жмёт на дату и видит уроки:
     начало–конец, предмет, кабинет.
 
@@ -59,16 +61,16 @@ SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "10"))  # 0 — выкл�
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 DB_PATH = os.getenv("DB_PATH", "schedule.db")
 
-# Расписание звонков по умолчанию (если в таблице не указаны «Начало»/«Конец»).
+# Расписание звонков по умолчанию (если в таблице / при ручном вводе не указаны начало и конец).
 DEFAULT_BELLS: dict[int, tuple[str, str]] = {
-    1: ("08:00", "08:40"),
-    2: ("08:50", "09:30"),
-    3: ("9:50", "10:30"),
-    4: ("10:50", "11:30"),
-    5: ("11:50", "12:30"),
-    6: ("12:45", "13:25"),
-    7: ("13:40", "14:20"),
-    8: ("14:40", "15:20"),
+    1: ("08:30", "09:15"),
+    2: ("09:25", "10:10"),
+    3: ("10:25", "11:10"),
+    4: ("11:25", "12:10"),
+    5: ("12:20", "13:05"),
+    6: ("13:15", "14:00"),
+    7: ("14:10", "14:55"),
+    8: ("15:05", "15:50"),
 }
 
 MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -83,8 +85,13 @@ BTN_TODAY = "Сегодня"
 BTN_TOMORROW = "Завтра"
 BTN_CLASS = "🏫 Сменить класс"
 
+SRC_SHEET = "sheet"    # урок загружен из Google Таблицы
+SRC_MANUAL = "manual"  # урок добавлен админом вручную
+
+
 # ════════════════════════════ ВСПОМОГАТЕЛЬНОЕ ════════════════════════════
 class Lesson(NamedTuple):
+    """Урок, разобранный из таблицы (ещё не в базе)."""
     class_name: str
     weekday: int      # 0 = Пн … 6 = Вс
     lesson_no: int
@@ -92,6 +99,19 @@ class Lesson(NamedTuple):
     time_end: str     # "09:15"
     subject: str
     room: str
+
+
+class StoredLesson(NamedTuple):
+    """Урок из базы данных."""
+    id: int
+    class_name: str
+    weekday: int
+    lesson_no: int
+    time_start: str
+    time_end: str
+    subject: str
+    room: str
+    source: str       # SRC_SHEET или SRC_MANUAL
 
 
 # Латиницу, похожую на кириллицу, превращаем в кириллицу («5A» → «5А»)
@@ -137,6 +157,10 @@ def chunk(seq: list, n: int) -> list[list]:
     return [seq[i:i + n] for i in range(0, len(seq), n)]
 
 
+def short(s: str, n: int = 22) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def today_date() -> date:
     return datetime.now(TZ).date()
 
@@ -160,13 +184,19 @@ async def init_db() -> None:
                 time_start TEXT    NOT NULL,
                 time_end   TEXT    NOT NULL,
                 subject    TEXT    NOT NULL,
-                room       TEXT    NOT NULL DEFAULT ''
+                room       TEXT    NOT NULL DEFAULT '',
+                source     TEXT    NOT NULL DEFAULT 'sheet'
             );
-            CREATE INDEX IF NOT EXISTS idx_lessons ON lessons(class_name, weekday);
             CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, class_name TEXT);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             """
         )
+        # Миграция со старой версии базы (без столбца source)
+        cur = await db.execute("PRAGMA table_info(lessons)")
+        columns = [r[1] for r in await cur.fetchall()]
+        if "source" not in columns:
+            await db.execute("ALTER TABLE lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'sheet'")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_lessons ON lessons(class_name, weekday)")
         await db.commit()
 
 
@@ -213,18 +243,88 @@ async def set_user_class(user_id: int, class_name: str) -> None:
     )
 
 
-async def get_lessons(class_name: str, weekday: int) -> list[Lesson]:
+async def get_lessons(class_name: str, weekday: int) -> list[StoredLesson]:
     rows = await db_fetchall(
-        "SELECT class_name, weekday, lesson_no, time_start, time_end, subject, room "
-        "FROM lessons WHERE class_name = ? AND weekday = ? ORDER BY lesson_no, time_start",
+        "SELECT id, class_name, weekday, lesson_no, time_start, time_end, subject, room, source "
+        "FROM lessons WHERE class_name = ? AND weekday = ? ORDER BY lesson_no, time_start, id",
         (class_name, weekday),
     )
-    return [Lesson(*r) for r in rows]
+    return [StoredLesson(*r) for r in rows]
 
 
 async def get_meta(key: str) -> str | None:
     rows = await db_fetchall("SELECT value FROM meta WHERE key = ?", (key,))
     return rows[0][0] if rows else None
+
+
+async def add_manual_lessons(class_name: str, weekday: int,
+                             items: list[tuple[int, str, str, str, str]]) -> tuple[int, int]:
+    """Добавляет уроки, введённые вручную. Возвращает (добавлено, пропущено как дубликаты)."""
+    added = dup = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for no, t_start, t_end, subject, room in items:
+            cur = await db.execute(
+                "SELECT 1 FROM lessons WHERE class_name = ? AND weekday = ? AND lesson_no = ? "
+                "AND subject = ? AND room = ? AND source = ?",
+                (class_name, weekday, no, subject, room, SRC_MANUAL),
+            )
+            if await cur.fetchall():
+                dup += 1
+                continue
+            await db.execute(
+                "INSERT INTO lessons(class_name, weekday, lesson_no, time_start, time_end, subject, room, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (class_name, weekday, no, t_start, t_end, subject, room, SRC_MANUAL),
+            )
+            added += 1
+        await db.commit()
+    return added, dup
+
+
+def parse_manual_lines(text: str) -> tuple[list[tuple[int, str, str, str, str]], list[str]]:
+    """
+    Разбирает уроки, введённые админом. Одна строка — один урок:
+        № ; Предмет ; Кабинет ; Начало ; Конец
+    Кабинет, начало и конец необязательны (время берётся из DEFAULT_BELLS).
+    Возвращает (уроки, ошибки).
+    """
+    items: list[tuple[int, str, str, str, str]] = []
+    errors: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in re.split(r"[;|]", line)]
+
+        m = re.fullmatch(r"\d{1,2}", parts[0].rstrip(".)"))
+        if not m:
+            errors.append(f"«{line}» — строка должна начинаться с номера урока")
+            continue
+        no = int(m.group())
+        if not 1 <= no <= 15:
+            errors.append(f"«{line}» — номер урока должен быть от 1 до 15")
+            continue
+
+        subject = parts[1] if len(parts) > 1 else ""
+        if not subject:
+            errors.append(f"«{line}» — не указан предмет")
+            continue
+        room = parts[2] if len(parts) > 2 else ""
+        raw_start = parts[3] if len(parts) > 3 else ""
+        raw_end = parts[4] if len(parts) > 4 else ""
+
+        default = DEFAULT_BELLS.get(no, (None, None))
+        start = parse_time(raw_start) if raw_start else default[0]
+        end = parse_time(raw_end) if raw_end else default[1]
+        if (raw_start and start is None) or (raw_end and end is None):
+            errors.append(f"«{line}» — неверное время (нужен формат ЧЧ:ММ)")
+            continue
+        if not start or not end:
+            errors.append(f"«{line}» — для урока №{no} не задано время, укажите начало и конец")
+            continue
+
+        items.append((no, start, end, subject, room))
+    return items, errors
 
 
 # ════════════════════════════ GOOGLE ТАБЛИЦА ════════════════════════════
@@ -342,10 +442,11 @@ async def run_sync() -> str:
         skipped = sorted({l.class_name for l in lessons} - known, key=class_sort_key)
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM lessons")
+            # Удаляем только уроки из таблицы — добавленные вручную остаются
+            await db.execute("DELETE FROM lessons WHERE source = ?", (SRC_SHEET,))
             await db.executemany(
-                "INSERT INTO lessons(class_name, weekday, lesson_no, time_start, time_end, subject, room) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO lessons(class_name, weekday, lesson_no, time_start, time_end, subject, room, source) "
+                f"VALUES (?, ?, ?, ?, ?, ?, ?, '{SRC_SHEET}')",
                 to_save,
             )
             await db.execute(
@@ -438,7 +539,7 @@ def calendar_title(class_name: str) -> str:
     return f"📅 Класс <b>{class_name}</b> — выберите дату:"
 
 
-def format_day(d: date, class_name: str, lessons: list[Lesson]) -> str:
+def format_day(d: date, class_name: str, lessons: list[StoredLesson]) -> str:
     head = f"📅 <b>{WEEKDAYS_FULL[d.weekday()]}, {d.day} {MONTHS_GEN[d.month - 1]}</b>\nКласс: <b>{class_name}</b>\n"
     if not lessons:
         return head + "\nУроков нет 🎉"
@@ -579,24 +680,26 @@ admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 
 class AdminFlow(StatesGroup):
     adding_class = State()
+    adding_lessons = State()
 
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить класс", callback_data="adm:add")],
         [InlineKeyboardButton(text="🗑 Удалить класс", callback_data="adm:del")],
+        [InlineKeyboardButton(text="✏️ Расписание вручную", callback_data="adm:sched")],
         [InlineKeyboardButton(text="🔄 Обновить из таблицы", callback_data="adm:sync")],
     ])
 
 
 async def panel_text(note: str = "") -> str:
     classes = await get_classes()
-    count = (await db_fetchall("SELECT COUNT(*) FROM lessons"))[0][0]
+    counts = dict(await db_fetchall("SELECT source, COUNT(*) FROM lessons GROUP BY source"))
     last = await get_meta("last_sync") or "ещё не было"
     text = (
         "🛠 <b>Панель администратора</b>\n\n"
         f"Классы: {', '.join(classes) if classes else 'пока нет'}\n"
-        f"Уроков в базе: {count}\n"
+        f"Уроков в базе: из таблицы — {counts.get(SRC_SHEET, 0)}, вручную — {counts.get(SRC_MANUAL, 0)}\n"
         f"Последнее обновление из таблицы: {last}"
     )
     if SHEET_ID:
@@ -624,7 +727,8 @@ async def cmd_sync(m: Message) -> None:
 
 
 @admin_router.callback_query(F.data == "adm:back")
-async def adm_back(cb: CallbackQuery) -> None:
+async def adm_back(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await safe_edit(cb.message, await panel_text(), admin_panel_kb())
     await cb.answer()
 
@@ -680,7 +784,8 @@ async def adm_add_process(m: Message, state: FSMContext) -> None:
 
 # ── удаление классов ──
 @admin_router.callback_query(F.data == "adm:del")
-async def adm_del(cb: CallbackQuery) -> None:
+async def adm_del(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     classes = await get_classes()
     if not classes:
         await cb.answer("Классов пока нет", show_alert=True)
@@ -700,8 +805,8 @@ async def adm_del_ask(cb: CallbackQuery) -> None:
     ]])
     await safe_edit(
         cb.message,
-        f"Удалить класс <b>{name}</b>?\nВсе его уроки удалятся, а ученики этого класса "
-        "должны будут выбрать класс заново.",
+        f"Удалить класс <b>{name}</b>?\nВсе его уроки (и из таблицы, и добавленные вручную) удалятся, "
+        "а ученики этого класса должны будут выбрать класс заново.",
         kb,
     )
     await cb.answer()
@@ -713,6 +818,154 @@ async def adm_del_yes(cb: CallbackQuery) -> None:
     await delete_class(name)
     await safe_edit(cb.message, await panel_text(f"🗑 Класс {name} удалён."), admin_panel_kb())
     await cb.answer()
+
+
+# ── ручное добавление расписания ──
+MANUAL_HELP = (
+    "Отправьте уроки — по одному на строку, части через «;»:\n"
+    "<code>№ ; Предмет ; Кабинет ; Начало ; Конец</code>\n\n"
+    "Кабинет, начало и конец необязательны: если время не указано, берётся из расписания звонков. "
+    "Можно прислать сразу весь день. Пример:\n"
+    "<code>1; Математика; 12\n"
+    "2; Русский язык; 14; 09:30; 10:15\n"
+    "3; Физкультура</code>\n\n"
+    "Отмена — /cancel"
+)
+
+
+async def parse_cls_wd(data: str) -> tuple[str, int] | None:
+    """Достаёт (класс, день недели) из callback_data вида 'xxx:5А:2'."""
+    try:
+        _, cls, wd_raw = data.split(":")
+        wd = int(wd_raw)
+    except ValueError:
+        return None
+    if not 0 <= wd <= 6 or cls not in await get_classes():
+        return None
+    return cls, wd
+
+
+async def manual_day_view(cls: str, wd: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Список уроков класса на день недели с кнопками удаления ручных уроков."""
+    lessons = await get_lessons(cls, wd)
+    text = f"✏️ Класс <b>{cls}</b>, <b>{WEEKDAYS_FULL[wd]}</b>\n\n"
+    rows: list[list[InlineKeyboardButton]] = []
+    if lessons:
+        for l in lessons:
+            room = f" (каб. {html.escape(l.room)})" if l.room else ""
+            mark = "✏️" if l.source == SRC_MANUAL else "📄"
+            text += f"{mark} <b>{l.lesson_no}.</b> {l.time_start}–{l.time_end} — {html.escape(l.subject)}{room}\n"
+            if l.source == SRC_MANUAL:
+                rows.append([InlineKeyboardButton(
+                    text=f"🗑 {l.lesson_no}. {short(l.subject)}", callback_data=f"mdel:{l.id}")])
+        text += (
+            "\n📄 — из таблицы (меняется в самой таблице)"
+            "\n✏️ — добавлено вручную (удаляется кнопкой ниже)"
+        )
+    else:
+        text += "Уроков пока нет."
+    rows.append([InlineKeyboardButton(text="➕ Добавить уроки", callback_data=f"madd:{cls}:{wd}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К дням недели", callback_data=f"mcls:{cls}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@admin_router.callback_query(F.data == "adm:sched")
+async def adm_sched(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    classes = await get_classes()
+    if not classes:
+        await cb.answer("Сначала добавьте класс", show_alert=True)
+        return
+    kb = classes_kb(classes, "mcls", extra_row=[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")])
+    await safe_edit(cb.message, "✏️ <b>Расписание вручную</b>\nВыберите класс:", kb)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("mcls:"))
+async def adm_mcls(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    cls = cb.data.split(":", 1)[1]
+    if cls not in await get_classes():
+        await cb.answer("Такого класса уже нет", show_alert=True)
+        return
+    days = [InlineKeyboardButton(text=WEEKDAYS_SHORT[i], callback_data=f"mday:{cls}:{i}") for i in range(7)]
+    rows = chunk(days, 4) + [[InlineKeyboardButton(text="⬅️ К классам", callback_data="adm:sched")]]
+    await safe_edit(cb.message, f"✏️ Класс <b>{cls}</b>. Выберите день недели:",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("mday:"))
+async def adm_mday(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    parsed = await parse_cls_wd(cb.data)
+    if not parsed:
+        await cb.answer("Класс не найден", show_alert=True)
+        return
+    text, kb = await manual_day_view(*parsed)
+    await safe_edit(cb.message, text, kb)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("madd:"))
+async def adm_madd(cb: CallbackQuery, state: FSMContext) -> None:
+    parsed = await parse_cls_wd(cb.data)
+    if not parsed:
+        await cb.answer("Класс не найден", show_alert=True)
+        return
+    cls, wd = parsed
+    await state.set_state(AdminFlow.adding_lessons)
+    await state.update_data(cls=cls, wd=wd)
+    await cb.message.answer(f"Класс <b>{cls}</b>, <b>{WEEKDAYS_FULL[wd]}</b>.\n\n{MANUAL_HELP}")
+    await cb.answer()
+
+
+@admin_router.message(AdminFlow.adding_lessons, F.text, ~F.text.startswith("/"))
+async def adm_madd_process(m: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    cls, wd = data.get("cls"), data.get("wd")
+    if cls is None or wd is None or cls not in await get_classes():
+        await state.clear()
+        await m.answer("Класс не найден. Откройте /admin и начните заново.")
+        return
+
+    items, errors = parse_manual_lines(m.text)
+    added, dup = await add_manual_lessons(cls, wd, items) if items else (0, 0)
+
+    lines = []
+    if added:
+        lines.append(f"✅ Добавлено уроков: {added}")
+    if dup:
+        lines.append(f"Уже были (пропущено): {dup}")
+    if errors:
+        lines.append("Не удалось разобрать:\n" + "\n".join(f"• {html.escape(e)}" for e in errors[:10]))
+    if not items and not errors:
+        lines.append("Не нашёл ни одного урока. Пример: <code>1; Математика; 12</code>")
+    lines.append("Можно прислать ещё уроки или нажать «Готово».")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Готово", callback_data=f"mday:{cls}:{wd}"),
+    ]])
+    await m.answer("\n\n".join(lines), reply_markup=kb)
+
+
+@admin_router.callback_query(F.data.startswith("mdel:"))
+async def adm_mdel(cb: CallbackQuery) -> None:
+    try:
+        lesson_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    rows = await db_fetchall(
+        "SELECT class_name, weekday FROM lessons WHERE id = ? AND source = ?", (lesson_id, SRC_MANUAL))
+    if not rows:
+        await cb.answer("Этот урок уже удалён", show_alert=True)
+        return
+    cls, wd = rows[0]
+    await db_execute("DELETE FROM lessons WHERE id = ? AND source = ?", (lesson_id, SRC_MANUAL))
+    text, kb = await manual_day_view(cls, wd)
+    await safe_edit(cb.message, text, kb)
+    await cb.answer("Урок удалён")
 
 
 # ════════════════════════════ ЗАПУСК ════════════════════════════
