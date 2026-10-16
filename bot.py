@@ -146,7 +146,6 @@ def get_classes_keyboard(action_prefix="class", page: int = 0):
     if row:
         kb.append(row)
 
-    # Кнопки навигации страниц, если страниц больше одной
     if total_pages > 1:
         nav_row = []
         if page > 0:
@@ -253,8 +252,8 @@ class AddClassWizard(StatesGroup):
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в школьный бот с расписанием!**\n\n"
-        "Сначала выберите ваш класс с помощью кнопок ниже:",
-        reply_markup=get_classes_keyboard("user_class", page=0),
+        "Используйте меню внизу для просмотра расписания и календаря.",
+        reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -262,7 +261,6 @@ async def cmd_start(message: types.Message):
 async def change_class_handler(message: types.Message):
     await message.answer("Выберите ваш класс:", reply_markup=get_classes_keyboard("user_class", page=0))
 
-# Обработка переключения страниц классов
 @dp.callback_query(F.data.startswith("class_page:"))
 async def process_class_page_nav(callback: types.CallbackQuery):
     _, action_prefix, page_num = callback.data.split(":")
@@ -277,13 +275,7 @@ async def process_user_class(callback: types.CallbackQuery):
     user_selected_class[callback.from_user.id] = class_name
     
     await callback.message.edit_text(
-        f"✅ Класс успешно выбран: **{class_name}**.",
-        reply_markup=None,
-        parse_mode="Markdown"
-    )
-    await callback.message.answer(
-        f"Главное меню для класса **{class_name}**:",
-        reply_markup=get_main_keyboard(),
+        f"✅ Класс успешно выбран: **{class_name}**.\nТеперь вы можете смотреть расписание через меню внизу!",
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -292,7 +284,7 @@ async def process_user_class(callback: types.CallbackQuery):
 async def today_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
+        await message.answer("⚠️ Сначала выберите свой класс:", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
     class_name = user_selected_class[user_id]
@@ -303,7 +295,7 @@ async def today_schedule(message: types.Message):
 async def tomorrow_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
+        await message.answer("⚠️ Сначала выберите свой класс:", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
     class_name = user_selected_class[user_id]
@@ -314,10 +306,9 @@ async def tomorrow_schedule(message: types.Message):
 async def open_calendar_main(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
+        await message.answer("⚠️ Сначала выберите свой класс:", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
-    # Берём строго актуальный выбранный класс
     class_name = user_selected_class[user_id]
     await message.answer(
         f"📅 Календарь для класса **{class_name}**.\nВыберите нужный день:",
@@ -325,16 +316,21 @@ async def open_calendar_main(message: types.Message):
         parse_mode="Markdown"
     )
 
+@dp.callback_query(F.data.startswith("cal_date:"))
+async def process_calendar_date(callback: types.CallbackQuery):
+    _, class_name, date_str = callback.data.split(":")
+    schedule_text = get_schedule_by_date_and_class(date_str, class_name)
+    await callback.message.answer(schedule_text, parse_mode="Markdown")
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("cal_nav:"))
 async def process_calendar_nav(callback: types.CallbackQuery):
-    # При смене месяца подтягиваем актуальный класс пользователя или берем из callback
     user_id = callback.from_user.id
     class_name = user_selected_class.get(user_id)
     
     parts = callback.data.split(":")
     if len(parts) >= 4:
         _, cb_class, year, month = parts
-        # Если в callback зашит класс, но у пользователя сейчас выбран другой — берем актуальный
         if not class_name:
             class_name = cb_class
     else:
@@ -346,7 +342,6 @@ async def process_calendar_nav(callback: types.CallbackQuery):
         reply_markup=generate_calendar_keyboard(class_name, int(year), int(month))
     )
     await callback.answer()
-
 
 @dp.callback_query(F.data == "cal_close")
 async def process_calendar_close(callback: types.CallbackQuery):
@@ -366,6 +361,7 @@ async def admin_panel(message: types.Message):
     await message.answer(
         "Панель администратора:\n\n"
         "🏫 `/addclass` — Добавить новый класс\n"
+        "🗑 `/delclass` — Удалить класс\n"
         "➕ `/set` — Добавить расписание для класса\n"
         "👩‍🏫 `/addteacher` — Добавить учителя\n"
         "🗑 `/delteacher` — Удалить учителя\n"
@@ -393,6 +389,38 @@ async def process_new_class(message: types.Message, state: FSMContext):
         await message.answer(f"⚠️ Класс **{class_name}** уже существует в базе.", parse_mode="Markdown")
     conn.close()
     await state.clear()
+
+@dp.message(Command("delclass"))
+async def delete_class_menu(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, class_name FROM classes ORDER BY class_name")
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("🏫 База классов пуста, некого удалять.", parse_mode="Markdown")
+        return
+
+    kb = []
+    for c_id, c_name in rows:
+        kb.append([InlineKeyboardButton(text=f"❌ Удалить класс {c_name}", callback_data=f"del_class:{c_id}")])
+
+    await message.answer("Выберите класс, который хотите удалить:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("del_class:"))
+async def process_delete_class(callback: types.CallbackQuery):
+    c_id = callback.data.split(":")[1]
+    conn = sqlite3.connect("schedule.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM classes WHERE id = ?", (c_id,))
+    conn.commit()
+    conn.close()
+
+    await callback.answer("Класс успешно удален!")
+    await callback.message.edit_text("✅ Класс успешно удален из базы данных.")
 
 @dp.message(Command("teachers"))
 async def list_teachers(message: types.Message):
@@ -522,6 +550,7 @@ async def process_wizard_date(message: types.Message, state: FSMContext):
 @dp.message(AddScheduleWizard.lessons_text)
 async def process_wizard_lessons(message: types.Message, state: FSMContext):
     data = await state.get_data()
+    class_name = data["data"] if "data" in data else data["class_name"] # страховка
     class_name = data["class_name"]
     db_date = data["date"]
     
