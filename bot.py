@@ -24,7 +24,7 @@ ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Словарь для хранения выбранного класса конкретным пользователем в памяти
+# Словарь для хранения выбранного класса конкретным пользователем
 user_selected_class = {}
 
 # --- База данных ---
@@ -120,18 +120,42 @@ def get_classes_from_db():
     conn.close()
     return [row[0] for row in rows]
 
-def get_classes_keyboard(action_prefix="class"):
+# Генератор клавиатуры классов с пагинацией (по 12 штук на странице)
+def get_classes_keyboard(action_prefix="class", page: int = 0):
     classes_list = get_classes_from_db()
+    PER_PAGE = 12
+    total_classes = len(classes_list)
+    total_pages = (total_classes + PER_PAGE - 1) // PER_PAGE
+    
+    if page < 0:
+        page = 0
+    if page >= total_pages and total_pages > 0:
+        page = total_pages - 1
+
+    start_idx = page * PER_PAGE
+    end_idx = start_idx + PER_PAGE
+    current_classes = classes_list[start_idx:end_idx]
+
     kb = []
-    # Делаем удобную сетку: по 3 класса в ряд, но рядов может быть сколько угодно (хоть 30)
     row = []
-    for c in classes_list:
+    for c in current_classes:
         row.append(InlineKeyboardButton(text=c, callback_data=f"{action_prefix}:{c}"))
         if len(row) == 3:
             kb.append(row)
             row = []
     if row:
         kb.append(row)
+
+    # Кнопки навигации страниц, если страниц больше одной
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"class_page:{action_prefix}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="ignore"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"class_page:{action_prefix}:{page + 1}"))
+        kb.append(nav_row)
+
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # --- Генератор Инлайн-Календаря ---
@@ -230,13 +254,22 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 **Добро пожаловать в школьный бот с расписанием!**\n\n"
         "Сначала выберите ваш класс с помощью кнопок ниже:",
-        reply_markup=get_classes_keyboard("user_class"),
+        reply_markup=get_classes_keyboard("user_class", page=0),
         parse_mode="Markdown"
     )
 
 @dp.message(F.text == "🏫 Сменить класс")
 async def change_class_handler(message: types.Message):
-    await message.answer("Выберите ваш класс:", reply_markup=get_classes_keyboard("user_class"))
+    await message.answer("Выберите ваш класс:", reply_markup=get_classes_keyboard("user_class", page=0))
+
+# Обработка переключения страниц классов
+@dp.callback_query(F.data.startswith("class_page:"))
+async def process_class_page_nav(callback: types.CallbackQuery):
+    _, action_prefix, page_num = callback.data.split(":")
+    await callback.message.edit_reply_markup(
+        reply_markup=get_classes_keyboard(action_prefix, page=int(page_num))
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("user_class:"))
 async def process_user_class(callback: types.CallbackQuery):
@@ -259,7 +292,7 @@ async def process_user_class(callback: types.CallbackQuery):
 async def today_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
     class_name = user_selected_class[user_id]
@@ -270,7 +303,7 @@ async def today_schedule(message: types.Message):
 async def tomorrow_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
     class_name = user_selected_class[user_id]
@@ -281,7 +314,7 @@ async def tomorrow_schedule(message: types.Message):
 async def open_calendar_main(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
-        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
     class_name = user_selected_class[user_id]
@@ -439,10 +472,8 @@ async def start_wizard(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Доступ запрещен.")
         return
-    # Сбрасываем старое состояние на всякий случай, чтобы данные не перемешались
     await state.clear()
-    await message.answer("Выберите класс для добавления расписания:", reply_markup=get_classes_keyboard("admin_class"))
-
+    await message.answer("Выберите класс для добавления расписания:", reply_markup=get_classes_keyboard("admin_class", page=0))
 
 @dp.callback_query(F.data.startswith("admin_class:"))
 async def process_admin_class(callback: types.CallbackQuery, state: FSMContext):
