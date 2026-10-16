@@ -32,6 +32,7 @@ def init_db():
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
+    
     # Таблица расписания
     cursor.execute(
         """
