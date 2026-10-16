@@ -123,6 +123,7 @@ def get_classes_from_db():
 def get_classes_keyboard(action_prefix="class"):
     classes_list = get_classes_from_db()
     kb = []
+    # Делаем удобную сетку: по 3 класса в ряд, но рядов может быть сколько угодно (хоть 30)
     row = []
     for c in classes_list:
         row.append(InlineKeyboardButton(text=c, callback_data=f"{action_prefix}:{c}"))
