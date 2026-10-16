@@ -15,7 +15,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from aiohttp import web
 
@@ -25,7 +24,7 @@ ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Словарь для хранения выбранного класса конкретным пользователем в памяти (в рамках сессии)
+# Словарь для хранения выбранного класса конкретным пользователем в памяти
 user_selected_class = {}
 
 # --- База данных ---
@@ -107,8 +106,9 @@ def format_date_display(date_str: str) -> str:
 # --- Клавиатуры ---
 def get_main_keyboard():
     kb = [
-        [KeyboardButton(text="📅 Расписание на сегодня"), KeyboardButton(text="📆 Расписание на завтра")],
-        [KeyboardButton(text="🗓 Выбрать другой класс / календарь"), KeyboardButton(text="⚙️ Админ-панель")]
+        [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Завтра")],
+        [KeyboardButton(text="🗓 Календарь"), KeyboardButton(text="🏫 Сменить класс")],
+        [KeyboardButton(text="⚙️ Админ-панель")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -233,8 +233,8 @@ async def cmd_start(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "🗓 Выбрать другой класс / календарь")
-async def choose_class_for_schedule(message: types.Message):
+@dp.message(F.text == "🏫 Сменить класс")
+async def change_class_handler(message: types.Message):
     await message.answer("Выберите ваш класс:", reply_markup=get_classes_keyboard("user_class"))
 
 @dp.callback_query(F.data.startswith("user_class:"))
@@ -243,12 +243,10 @@ async def process_user_class(callback: types.CallbackQuery):
     user_selected_class[callback.from_user.id] = class_name
     
     await callback.message.edit_text(
-        f"✅ Класс успешно выбран: **{class_name}**.\n\n"
-        "Теперь вы можете нажимать на кнопки внизу (**«Расписание на сегодня»** или **«на завтра»**), либо открыть календарь кнопкой выше.",
+        f"✅ Класс успешно выбран: **{class_name}**.",
         reply_markup=None,
         parse_mode="Markdown"
     )
-    # Отправляем главное меню с плашками
     await callback.message.answer(
         f"Главное меню для класса **{class_name}**:",
         reply_markup=get_main_keyboard(),
@@ -256,7 +254,7 @@ async def process_user_class(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-@dp.message(F.text == "📅 Расписание на сегодня")
+@dp.message(F.text == "📅 Сегодня")
 async def today_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
@@ -267,7 +265,7 @@ async def today_schedule(message: types.Message):
     today = datetime.now().strftime("%Y-%m-%d")
     await message.answer(get_schedule_by_date_and_class(today, class_name), parse_mode="Markdown")
 
-@dp.message(F.text == "📆 Расписание на завтра")
+@dp.message(F.text == "📆 Завтра")
 async def tomorrow_schedule(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_selected_class:
@@ -277,6 +275,20 @@ async def tomorrow_schedule(message: types.Message):
     class_name = user_selected_class[user_id]
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     await message.answer(get_schedule_by_date_and_class(tomorrow, class_name), parse_mode="Markdown")
+
+@dp.message(F.text == "🗓 Календарь")
+async def open_calendar_main(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_selected_class:
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        return
+    
+    class_name = user_selected_class[user_id]
+    await message.answer(
+        f"📅 Календарь для класса **{class_name}**.\nВыберите нужный день:",
+        reply_markup=generate_calendar_keyboard(class_name),
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data.startswith("cal_date:"))
 async def process_calendar_date(callback: types.CallbackQuery):
