@@ -435,8 +435,7 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
-    cursor.execute("DELETE FROM schedule 
-    WHERE date = ? AND class_name = ?", (db_date, class_name))
+    cursor.execute("DELETE FROM schedule WHERE date = ? AND class_name = ?", (db_date, class_name))
 
     added_count = 0
     for line in lines:
