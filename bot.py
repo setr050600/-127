@@ -317,6 +317,7 @@ async def open_calendar_main(message: types.Message):
         await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class", page=0))
         return
     
+    # Берём строго актуальный выбранный класс
     class_name = user_selected_class[user_id]
     await message.answer(
         f"📅 Календарь для класса **{class_name}**.\nВыберите нужный день:",
@@ -324,20 +325,28 @@ async def open_calendar_main(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.callback_query(F.data.startswith("cal_date:"))
-async def process_calendar_date(callback: types.CallbackQuery):
-    _, class_name, date_str = callback.data.split(":")
-    schedule_text = get_schedule_by_date_and_class(date_str, class_name)
-    await callback.message.answer(schedule_text, parse_mode="Markdown")
-    await callback.answer()
-
 @dp.callback_query(F.data.startswith("cal_nav:"))
 async def process_calendar_nav(callback: types.CallbackQuery):
-    _, class_name, year, month = callback.data.split(":")
+    # При смене месяца подтягиваем актуальный класс пользователя или берем из callback
+    user_id = callback.from_user.id
+    class_name = user_selected_class.get(user_id)
+    
+    parts = callback.data.split(":")
+    if len(parts) >= 4:
+        _, cb_class, year, month = parts
+        # Если в callback зашит класс, но у пользователя сейчас выбран другой — берем актуальный
+        if not class_name:
+            class_name = cb_class
+    else:
+        _, year, month = parts
+        if not class_name:
+            class_name = "5А"
+
     await callback.message.edit_reply_markup(
         reply_markup=generate_calendar_keyboard(class_name, int(year), int(month))
     )
     await callback.answer()
+
 
 @dp.callback_query(F.data == "cal_close")
 async def process_calendar_close(callback: types.CallbackQuery):
