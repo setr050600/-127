@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiohttp import web
 
@@ -23,6 +24,9 @@ ADMIN_IDS = [884058025]  # Укажите ваш Telegram ID
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Словарь для хранения выбранного класса конкретным пользователем в памяти (в рамках сессии)
+user_selected_class = {}
 
 # --- База данных ---
 def init_db():
@@ -103,7 +107,8 @@ def format_date_display(date_str: str) -> str:
 # --- Клавиатуры ---
 def get_main_keyboard():
     kb = [
-        [KeyboardButton(text="📅 Посмотреть расписание"), KeyboardButton(text="⚙️ Админ-панель")]
+        [KeyboardButton(text="📅 Расписание на сегодня"), KeyboardButton(text="📆 Расписание на завтра")],
+        [KeyboardButton(text="🗓 Выбрать другой класс / календарь"), KeyboardButton(text="⚙️ Админ-панель")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -222,23 +227,56 @@ class AddClassWizard(StatesGroup):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Я школьный бот с расписанием 🏫\nВыбери нужный раздел в меню ниже:",
-        reply_markup=get_main_keyboard()
+        "👋 **Добро пожаловать в школьный бот с расписанием!**\n\n"
+        "Сначала выберите ваш класс с помощью кнопок ниже:",
+        reply_markup=get_classes_keyboard("user_class"),
+        parse_mode="Markdown"
     )
 
-@dp.message(F.text == "📅 Посмотреть расписание")
+@dp.message(F.text == "🗓 Выбрать другой класс / календарь")
 async def choose_class_for_schedule(message: types.Message):
-    await message.answer("Сначала выберите ваш класс:", reply_markup=get_classes_keyboard("user_class"))
+    await message.answer("Выберите ваш класс:", reply_markup=get_classes_keyboard("user_class"))
 
 @dp.callback_query(F.data.startswith("user_class:"))
 async def process_user_class(callback: types.CallbackQuery):
     class_name = callback.data.split(":")[1]
+    user_selected_class[callback.from_user.id] = class_name
+    
     await callback.message.edit_text(
-        f"Класс выбран: **{class_name}**.\nТеперь выберите день в календаре:",
-        reply_markup=generate_calendar_keyboard(class_name),
+        f"✅ Класс успешно выбран: **{class_name}**.\n\n"
+        "Теперь вы можете нажимать на кнопки внизу (**«Расписание на сегодня»** или **«на завтра»**), либо открыть календарь кнопкой выше.",
+        reply_markup=None,
+        parse_mode="Markdown"
+    )
+    # Отправляем главное меню с плашками
+    await callback.message.answer(
+        f"Главное меню для класса **{class_name}**:",
+        reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
     await callback.answer()
+
+@dp.message(F.text == "📅 Расписание на сегодня")
+async def today_schedule(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_selected_class:
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        return
+    
+    class_name = user_selected_class[user_id]
+    today = datetime.now().strftime("%Y-%m-%d")
+    await message.answer(get_schedule_by_date_and_class(today, class_name), parse_mode="Markdown")
+
+@dp.message(F.text == "📆 Расписание на завтра")
+async def tomorrow_schedule(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_selected_class:
+        await message.answer("⚠️ Сначала выберите свой класс!", reply_markup=get_classes_keyboard("user_class"))
+        return
+    
+    class_name = user_selected_class[user_id]
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    await message.answer(get_schedule_by_date_and_class(tomorrow, class_name), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("cal_date:"))
 async def process_calendar_date(callback: types.CallbackQuery):
@@ -445,8 +483,21 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
                 lesson_num = int(parts[0])
                 time_slot = parts[1]
                 subject = parts[2]
-                teacher = parts[3] if len(parts) > 3 else ""
-                room = parts[4] if len(parts) > 4 else ""
+                
+                if len(parts) >= 5:
+                    teacher = parts[3]
+                    room = parts[4]
+                elif len(parts) == 4:
+                    auto_teacher = get_teacher_for_subject(subject)
+                    if auto_teacher:
+                        teacher = auto_teacher
+                        room = parts[3]
+                    else:
+                        teacher = parts[3]
+                        room = ""
+                else:
+                    teacher = get_teacher_for_subject(subject)
+                    room = ""
 
                 cursor.execute(
                     "INSERT INTO schedule (date, class_name, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -463,7 +514,6 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     display_date = format_date_display(db_date)
     await message.answer(f"✅ Успешно добавлено уроков ({added_count}) для класса **{class_name}** на дату: **{display_date}**!", parse_mode="Markdown")
 
-# --- Веб-сервер в потоке и запуск бота ---
 def run_web_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
