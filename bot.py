@@ -438,7 +438,10 @@ async def start_wizard(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ Доступ запрещен.")
         return
+    # Сбрасываем старое состояние на всякий случай, чтобы данные не перемешались
+    await state.clear()
     await message.answer("Выберите класс для добавления расписания:", reply_markup=get_classes_keyboard("admin_class"))
+
 
 @dp.callback_query(F.data.startswith("admin_class:"))
 async def process_admin_class(callback: types.CallbackQuery, state: FSMContext):
