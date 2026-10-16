@@ -10,6 +10,11 @@ Telegram-бот «Школьное расписание» (aiogram 3, Python 3.1
   • ученик выбирает класс, открывает календарь, жмёт на дату и видит уроки:
     начало–конец, предмет, кабинет.
 
+Хранилище:
+  • по умолчанию — файл SQLite (удобно для запуска на своём компьютере);
+  • если задана переменная DATABASE_URL — PostgreSQL (нужно на Render и подобных
+    хостингах, где локальные файлы стираются при каждом перезапуске).
+
 Формат таблицы (первая строка — заголовки, порядок столбцов любой):
   Класс | День | № | Предмет | Кабинет | Начало | Конец
   «Начало» и «Конец» необязательны — если пусты, берутся из DEFAULT_BELLS ниже.
@@ -24,9 +29,11 @@ import io
 import logging
 import os
 import re
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta
 from typing import NamedTuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -48,6 +55,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from aiohttp import web
 from dotenv import load_dotenv
 
 # ════════════════════════════ НАСТРОЙКИ ════════════════════════════
@@ -59,7 +67,8 @@ SHEET_ID = os.getenv("SHEET_ID", "").strip()          # id между /d/ и /ed
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()       # id листа (число после gid= в ссылке)
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "10"))  # 0 — выключить автообновление
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
-DB_PATH = os.getenv("DB_PATH", "schedule.db")
+DB_PATH = os.getenv("DB_PATH", "schedule.db")         # файл SQLite (если нет DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # строка подключения к PostgreSQL
 
 # Расписание звонков по умолчанию (если в таблице / при ручном вводе не указаны начало и конец).
 DEFAULT_BELLS: dict[int, tuple[str, str]] = {
@@ -171,46 +180,145 @@ def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
 
 
 # ════════════════════════════ БАЗА ДАННЫХ ════════════════════════════
+# Один и тот же код работает и с SQLite, и с PostgreSQL: SQL написан в общем виде
+# (плейсхолдеры «?» для Postgres автоматически превращаются в $1, $2 …).
+_pg_pool = None   # пул соединений asyncpg, если используется PostgreSQL
+
+SQLITE_DDL = [
+    "CREATE TABLE IF NOT EXISTS classes (name TEXT PRIMARY KEY)",
+    """CREATE TABLE IF NOT EXISTS lessons (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        class_name TEXT    NOT NULL,
+        weekday    INTEGER NOT NULL,
+        lesson_no  INTEGER NOT NULL,
+        time_start TEXT    NOT NULL,
+        time_end   TEXT    NOT NULL,
+        subject    TEXT    NOT NULL,
+        room       TEXT    NOT NULL DEFAULT '',
+        source     TEXT    NOT NULL DEFAULT 'sheet'
+    )""",
+    "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, class_name TEXT)",
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+]
+PG_DDL = [
+    "CREATE TABLE IF NOT EXISTS classes (name TEXT PRIMARY KEY)",
+    """CREATE TABLE IF NOT EXISTS lessons (
+        id         BIGSERIAL PRIMARY KEY,
+        class_name TEXT    NOT NULL,
+        weekday    INTEGER NOT NULL,
+        lesson_no  INTEGER NOT NULL,
+        time_start TEXT    NOT NULL,
+        time_end   TEXT    NOT NULL,
+        subject    TEXT    NOT NULL,
+        room       TEXT    NOT NULL DEFAULT '',
+        source     TEXT    NOT NULL DEFAULT 'sheet'
+    )""",
+    "CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, class_name TEXT)",
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+]
+
+
+def clean_dsn(url: str) -> str:
+    """Убирает параметры строки подключения, которые не понимает asyncpg (channel_binding у Neon)."""
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "channel_binding"]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def pg_sql(sql: str) -> str:
+    """'?' → $1, $2, …"""
+    counter = iter(range(1, 10_000))
+    return re.sub(r"\?", lambda _: f"${next(counter)}", sql)
+
+
+class SqliteConn:
+    def __init__(self, conn) -> None:
+        self.c = conn
+
+    async def fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        cur = await self.c.execute(sql, params)
+        return [tuple(r) for r in await cur.fetchall()]
+
+    async def execute(self, sql: str, params: tuple = ()) -> int:
+        cur = await self.c.execute(sql, params)
+        return cur.rowcount
+
+    async def executemany(self, sql: str, seq) -> None:
+        await self.c.executemany(sql, [tuple(r) for r in seq])
+
+
+class PgConn:
+    def __init__(self, conn) -> None:
+        self.c = conn
+
+    async def fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        return [tuple(r.values()) for r in await self.c.fetch(pg_sql(sql), *params)]
+
+    async def execute(self, sql: str, params: tuple = ()) -> int:
+        status = await self.c.execute(pg_sql(sql), *params)   # например «INSERT 0 1», «DELETE 3»
+        m = re.search(r"(\d+)\s*$", status or "")
+        return int(m.group(1)) if m else 0
+
+    async def executemany(self, sql: str, seq) -> None:
+        rows = [tuple(r) for r in seq]
+        if rows:
+            await self.c.executemany(pg_sql(sql), rows)
+
+
+@asynccontextmanager
+async def transaction() -> AsyncIterator[SqliteConn | PgConn]:
+    """Соединение с базой: всё внутри блока применяется целиком или не применяется вовсе."""
+    if _pg_pool is not None:
+        async with _pg_pool.acquire() as conn:
+            async with conn.transaction():
+                yield PgConn(conn)
+    else:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            yield SqliteConn(conn)
+            await conn.commit()
+
+
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS classes (name TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS lessons (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                class_name TEXT    NOT NULL,
-                weekday    INTEGER NOT NULL,
-                lesson_no  INTEGER NOT NULL,
-                time_start TEXT    NOT NULL,
-                time_end   TEXT    NOT NULL,
-                subject    TEXT    NOT NULL,
-                room       TEXT    NOT NULL DEFAULT '',
-                source     TEXT    NOT NULL DEFAULT 'sheet'
-            );
-            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, class_name TEXT);
-            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-            """
+    global _pg_pool
+    if DATABASE_URL:
+        import asyncpg  # нужен только для PostgreSQL
+        _pg_pool = await asyncpg.create_pool(
+            clean_dsn(DATABASE_URL),
+            min_size=0,
+            max_size=5,
+            max_inactive_connection_lifetime=30,   # бесплатные облачные базы «засыпают» — не держим старые соединения
+            command_timeout=30,
+            statement_cache_size=0,                # совместимость с pgbouncer (Neon / Supabase)
         )
+    pg = _pg_pool is not None
+    async with transaction() as c:
+        for stmt in (PG_DDL if pg else SQLITE_DDL):
+            await c.execute(stmt)
         # Миграция со старой версии базы (без столбца source)
-        cur = await db.execute("PRAGMA table_info(lessons)")
-        columns = [r[1] for r in await cur.fetchall()]
-        if "source" not in columns:
-            await db.execute("ALTER TABLE lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'sheet'")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_lessons ON lessons(class_name, weekday)")
-        await db.commit()
+        if pg:
+            await c.execute("ALTER TABLE lessons ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'sheet'")
+        else:
+            columns = [r[1] for r in await c.fetchall("PRAGMA table_info(lessons)")]
+            if "source" not in columns:
+                await c.execute("ALTER TABLE lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'sheet'")
+        await c.execute("CREATE INDEX IF NOT EXISTS idx_lessons ON lessons(class_name, weekday)")
 
 
-async def db_fetchall(sql: str, params: tuple = ()) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(sql, params)
-        return list(await cur.fetchall())
+async def close_db() -> None:
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
+
+
+async def db_fetchall(sql: str, params: tuple = ()) -> list[tuple]:
+    async with transaction() as c:
+        return await c.fetchall(sql, params)
 
 
 async def db_execute(sql: str, params: tuple = ()) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(sql, params)
-        await db.commit()
-        return cur.rowcount
+    async with transaction() as c:
+        return await c.execute(sql, params)
 
 
 async def get_classes() -> list[str]:
@@ -219,15 +327,14 @@ async def get_classes() -> list[str]:
 
 
 async def add_class(name: str) -> bool:
-    return await db_execute("INSERT OR IGNORE INTO classes(name) VALUES (?)", (name,)) > 0
+    return await db_execute("INSERT INTO classes(name) VALUES (?) ON CONFLICT DO NOTHING", (name,)) > 0
 
 
 async def delete_class(name: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM lessons WHERE class_name = ?", (name,))
-        await db.execute("DELETE FROM classes WHERE name = ?", (name,))
-        await db.execute("UPDATE users SET class_name = NULL WHERE class_name = ?", (name,))
-        await db.commit()
+    async with transaction() as c:
+        await c.execute("DELETE FROM lessons WHERE class_name = ?", (name,))
+        await c.execute("DELETE FROM classes WHERE name = ?", (name,))
+        await c.execute("UPDATE users SET class_name = NULL WHERE class_name = ?", (name,))
 
 
 async def get_user_class(user_id: int) -> str | None:
@@ -261,23 +368,22 @@ async def add_manual_lessons(class_name: str, weekday: int,
                              items: list[tuple[int, str, str, str, str]]) -> tuple[int, int]:
     """Добавляет уроки, введённые вручную. Возвращает (добавлено, пропущено как дубликаты)."""
     added = dup = 0
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with transaction() as c:
         for no, t_start, t_end, subject, room in items:
-            cur = await db.execute(
+            exists = await c.fetchall(
                 "SELECT 1 FROM lessons WHERE class_name = ? AND weekday = ? AND lesson_no = ? "
                 "AND subject = ? AND room = ? AND source = ?",
                 (class_name, weekday, no, subject, room, SRC_MANUAL),
             )
-            if await cur.fetchall():
+            if exists:
                 dup += 1
                 continue
-            await db.execute(
+            await c.execute(
                 "INSERT INTO lessons(class_name, weekday, lesson_no, time_start, time_end, subject, room, source) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (class_name, weekday, no, t_start, t_end, subject, room, SRC_MANUAL),
             )
             added += 1
-        await db.commit()
     return added, dup
 
 
@@ -438,25 +544,35 @@ async def run_sync() -> str:
             raise ValueError("в таблице не найдено ни одного урока — расписание в боте не изменено")
 
         known = set(await get_classes())
+        auto_added: list[str] = []
+        if not known:
+            # Список классов пуст (первый запуск или база была потеряна) — берём классы из таблицы
+            auto_added = sorted({l.class_name for l in lessons if CLASS_RE.fullmatch(l.class_name)},
+                                key=class_sort_key)
+            known = set(auto_added)
+
         to_save = [l for l in lessons if l.class_name in known]
         skipped = sorted({l.class_name for l in lessons} - known, key=class_sort_key)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with transaction() as c:
+            for name in auto_added:
+                await c.execute("INSERT INTO classes(name) VALUES (?) ON CONFLICT DO NOTHING", (name,))
             # Удаляем только уроки из таблицы — добавленные вручную остаются
-            await db.execute("DELETE FROM lessons WHERE source = ?", (SRC_SHEET,))
-            await db.executemany(
+            await c.execute("DELETE FROM lessons WHERE source = ?", (SRC_SHEET,))
+            await c.executemany(
                 "INSERT INTO lessons(class_name, weekday, lesson_no, time_start, time_end, subject, room, source) "
                 f"VALUES (?, ?, ?, ?, ?, ?, ?, '{SRC_SHEET}')",
                 to_save,
             )
-            await db.execute(
+            await c.execute(
                 "INSERT INTO meta(key, value) VALUES ('last_sync', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (datetime.now(TZ).strftime("%d.%m.%Y %H:%M"),),
             )
-            await db.commit()
 
     parts = [f"✅ Расписание обновлено: {len(to_save)} уроков, классов: {len({l.class_name for l in to_save})}."]
+    if auto_added:
+        parts.append("Список классов был пуст — добавлены классы из таблицы: " + ", ".join(auto_added))
     if skipped:
         parts.append("В таблице есть классы, которых нет в боте (добавьте через /admin): " + ", ".join(skipped))
     if problems:
@@ -570,6 +686,15 @@ async def ask_class(m: Message) -> None:
     await m.answer("Выберите свой класс:", reply_markup=classes_kb(classes, "setclass"))
 
 
+async def offer_classes(msg: Message, text: str = "Выберите свой класс:") -> None:
+    """Подменяет сообщение со старыми кнопками на актуальный выбор класса (вместо тупика с ошибкой)."""
+    classes = await get_classes()
+    if not classes:
+        await safe_edit(msg, "Список классов пока пуст. Обратитесь к администратору.")
+    else:
+        await safe_edit(msg, text, classes_kb(classes, "setclass"))
+
+
 async def require_class(m: Message) -> str | None:
     cls = await get_user_class(m.from_user.id)
     if not cls:
@@ -595,7 +720,8 @@ async def cmd_start(m: Message) -> None:
 async def cb_setclass(cb: CallbackQuery) -> None:
     name = cb.data.split(":", 1)[1]
     if name not in await get_classes():
-        await cb.answer("Такого класса уже нет", show_alert=True)
+        await offer_classes(cb.message, "Список классов обновился — выберите свой класс ещё раз:")
+        await cb.answer()
         return
     await set_user_class(cb.from_user.id, name)
     with suppress(TelegramBadRequest):
@@ -646,7 +772,8 @@ async def cb_calendar(cb: CallbackQuery) -> None:
         return
     cls = await get_user_class(cb.from_user.id)
     if not cls:
-        await cb.answer("Сначала выберите класс: /start", show_alert=True)
+        await offer_classes(cb.message, "Сначала выберите свой класс:")
+        await cb.answer()
         return
     await safe_edit(cb.message, calendar_title(cls), calendar_kb(y, mth, today_date()))
     await cb.answer()
@@ -661,7 +788,8 @@ async def cb_day(cb: CallbackQuery) -> None:
         return
     cls = await get_user_class(cb.from_user.id)
     if not cls:
-        await cb.answer("Сначала выберите класс: /start", show_alert=True)
+        await offer_classes(cb.message, "Сначала выберите свой класс:")
+        await cb.answer()
         return
     await safe_edit(cb.message, format_day(d, cls, await get_lessons(cls, d.weekday())), day_nav_kb(d))
     await cb.answer()
@@ -692,18 +820,30 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def storage_warning() -> str:
+    """На Render без DATABASE_URL файл базы стирается при каждом перезапуске."""
+    if _pg_pool is None and os.getenv("RENDER"):
+        return ("⚠️ База хранится во временном файле Render и стирается при каждом перезапуске "
+                "(пропадают классы, выбор класса учениками и ручные уроки). Подключите DATABASE_URL.")
+    return ""
+
+
 async def panel_text(note: str = "") -> str:
     classes = await get_classes()
     counts = dict(await db_fetchall("SELECT source, COUNT(*) FROM lessons GROUP BY source"))
     last = await get_meta("last_sync") or "ещё не было"
+    backend = "PostgreSQL" if _pg_pool is not None else "SQLite (файл)"
     text = (
         "🛠 <b>Панель администратора</b>\n\n"
         f"Классы: {', '.join(classes) if classes else 'пока нет'}\n"
         f"Уроков в базе: из таблицы — {counts.get(SRC_SHEET, 0)}, вручную — {counts.get(SRC_MANUAL, 0)}\n"
-        f"Последнее обновление из таблицы: {last}"
+        f"Последнее обновление из таблицы: {last}\n"
+        f"Хранилище: {backend}"
     )
     if SHEET_ID:
         text += f'\n\n<a href="https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit">Открыть таблицу</a>'
+    if warning := storage_warning():
+        text += f"\n\n{warning}"
     if note:
         text += f"\n\n{note}"
     return text
@@ -886,7 +1026,7 @@ async def adm_mcls(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     cls = cb.data.split(":", 1)[1]
     if cls not in await get_classes():
-        await cb.answer("Такого класса уже нет", show_alert=True)
+        await cb.answer("Такого класса уже нет — откройте /admin заново", show_alert=True)
         return
     days = [InlineKeyboardButton(text=WEEKDAYS_SHORT[i], callback_data=f"mday:{cls}:{i}") for i in range(7)]
     rows = chunk(days, 4) + [[InlineKeyboardButton(text="⬅️ К классам", callback_data="adm:sched")]]
@@ -900,7 +1040,7 @@ async def adm_mday(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     parsed = await parse_cls_wd(cb.data)
     if not parsed:
-        await cb.answer("Класс не найден", show_alert=True)
+        await cb.answer("Класс не найден — откройте /admin заново", show_alert=True)
         return
     text, kb = await manual_day_view(*parsed)
     await safe_edit(cb.message, text, kb)
@@ -911,7 +1051,7 @@ async def adm_mday(cb: CallbackQuery, state: FSMContext) -> None:
 async def adm_madd(cb: CallbackQuery, state: FSMContext) -> None:
     parsed = await parse_cls_wd(cb.data)
     if not parsed:
-        await cb.answer("Класс не найден", show_alert=True)
+        await cb.answer("Класс не найден — откройте /admin заново", show_alert=True)
         return
     cls, wd = parsed
     await state.set_state(AdminFlow.adding_lessons)
@@ -968,6 +1108,45 @@ async def adm_mdel(cb: CallbackQuery) -> None:
     await cb.answer("Урок удалён")
 
 
+# ════════════════════════════ ХОСТИНГ (Render и т. п.) ════════════════════════════
+async def start_health_server() -> web.AppRunner | None:
+    """
+    Render «Web Service» требует, чтобы приложение слушало порт PORT, иначе считает сервис
+    неработающим и перезапускает его. Если PORT задан — поднимаем крошечный HTTP-сервер.
+    (На «Background Worker» и на обычном компьютере PORT нет, и сервер не запускается.)
+    """
+    port = os.getenv("PORT")
+    if not port:
+        return None
+
+    async def ok(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    logging.info("HTTP-сервер для проверок хостинга запущен на порту %s", port)
+    return runner
+
+
+async def keepalive_loop() -> None:
+    """Бесплатный Render Web Service засыпает через 15 минут без запросов — регулярно «стучимся» к себе."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                async with session.get(url) as resp:
+                    await resp.read()
+            except Exception as e:  # noqa: BLE001
+                logging.warning("Keep-alive не удался: %s", e)
+
+
 # ════════════════════════════ ЗАПУСК ════════════════════════════
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -977,6 +1156,12 @@ async def main() -> None:
         logging.warning("ADMIN_IDS пуст — админ-панель никому не доступна")
 
     await init_db()
+    logging.info("Хранилище: %s, классов в базе: %d",
+                 "PostgreSQL" if _pg_pool is not None else f"SQLite ({DB_PATH})", len(await get_classes()))
+    if warning := storage_warning():
+        logging.warning(warning)
+
+    runner = await start_health_server()
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -990,20 +1175,25 @@ async def main() -> None:
         BotCommand(command="tomorrow", description="Расписание на завтра"),
     ])
 
-    sync_task = None
+    background: list[asyncio.Task] = []
     if SHEET_ID:
         logging.info("Первичная синхронизация: %s", await safe_sync())
         if SYNC_INTERVAL_MIN > 0:
-            sync_task = asyncio.create_task(periodic_sync())
+            background.append(asyncio.create_task(periodic_sync()))
     else:
         logging.warning("SHEET_ID не задан — автоимпорт из Google Таблицы отключён")
+    if os.getenv("RENDER_EXTERNAL_URL"):
+        background.append(asyncio.create_task(keepalive_loop()))
 
     try:
         await dp.start_polling(bot)
     finally:
-        if sync_task:
-            sync_task.cancel()
+        for task in background:
+            task.cancel()
+        if runner:
+            await runner.cleanup()
         await bot.session.close()
+        await close_db()
 
 
 if __name__ == "__main__":
