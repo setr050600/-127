@@ -435,4 +435,49 @@ async def process_wizard_lessons(message: types.Message, state: FSMContext):
     conn = sqlite3.connect("schedule.db")
     cursor = conn.cursor()
     
-    cursor.execute("DELETE FROM schedule
+    cursor.execute("DELETE FROM schedule 
+    WHERE date = ? AND class_name = ?", (db_date, class_name))
+
+    added_count = 0
+    for line in lines:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3:
+            try:
+                lesson_num = int(parts[0])
+                time_slot = parts[1]
+                subject = parts[2]
+                teacher = parts[3] if len(parts) > 3 else ""
+                room = parts[4] if len(parts) > 4 else ""
+
+                cursor.execute(
+                    "INSERT INTO schedule (date, class_name, lesson_num, time_slot, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (db_date, class_name, lesson_num, time_slot, subject, teacher, room)
+                )
+                added_count += 1
+            except ValueError:
+                continue
+
+    conn.commit()
+    conn.close()
+    await state.clear()
+
+    display_date = format_date_display(db_date)
+    await message.answer(f"✅ Успешно добавлено уроков ({added_count}) для класса **{class_name}** на дату: **{display_date}**!", parse_mode="Markdown")
+
+# --- Веб-сервер в потоке и запуск бота ---
+def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+    port = int(os.getenv("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
+
+async def main():
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+    print("Веб-сервер запущен в фоне...")
+
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
