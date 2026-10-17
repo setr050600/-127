@@ -29,6 +29,7 @@ import io
 import logging
 import os
 import re
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta
@@ -96,6 +97,12 @@ BTN_CLASS = "🏫 Сменить класс"
 
 SRC_SHEET = "sheet"    # урок загружен из Google Таблицы
 SRC_MANUAL = "manual"  # урок добавлен админом вручную
+
+# Нажатие этих кнопок меню не должно считаться текстом, который вводит админ в диалоге
+MENU_TEXTS = {BTN_CAL, BTN_TODAY, BTN_TOMORROW, BTN_CLASS}
+
+INSTANCE_ID = secrets.token_hex(2)     # короткий номер запущенного экземпляра бота (виден админу в /admin)
+STARTED_AT = datetime.now(TZ)
 
 
 # ════════════════════════════ ВСПОМОГАТЕЛЬНОЕ ════════════════════════════
@@ -177,6 +184,12 @@ def today_date() -> date:
 def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     idx = year * 12 + (month - 1) + delta
     return idx // 12, idx % 12 + 1
+
+
+def add_minutes(hhmm: str, minutes: int) -> str | None:
+    h, m = map(int, hhmm.split(":"))
+    total = h * 60 + m + minutes
+    return None if total >= 24 * 60 else f"{total // 60:02d}:{total % 60:02d}"
 
 
 # ════════════════════════════ БАЗА ДАННЫХ ════════════════════════════
@@ -808,7 +821,11 @@ admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 
 class AdminFlow(StatesGroup):
     adding_class = State()
-    adding_lessons = State()
+    adding_lessons = State()   # пакетный ввод списком
+    lesson_subject = State()   # мастер: предмет
+    lesson_room = State()      # мастер: кабинет
+    lesson_start = State()     # мастер: начало (кнопками или текстом)
+    lesson_end = State()       # мастер: конец (кнопками или текстом)
 
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
@@ -838,7 +855,8 @@ async def panel_text(note: str = "") -> str:
         f"Классы: {', '.join(classes) if classes else 'пока нет'}\n"
         f"Уроков в базе: из таблицы — {counts.get(SRC_SHEET, 0)}, вручную — {counts.get(SRC_MANUAL, 0)}\n"
         f"Последнее обновление из таблицы: {last}\n"
-        f"Хранилище: {backend}"
+        f"Хранилище: {backend}\n"
+        f"Экземпляр бота: #{INSTANCE_ID}, запущен {STARTED_AT:%d.%m %H:%M}"
     )
     if SHEET_ID:
         text += f'\n\n<a href="https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit">Открыть таблицу</a>'
@@ -891,7 +909,7 @@ async def adm_add(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-@admin_router.message(AdminFlow.adding_class, F.text, ~F.text.startswith("/"))
+@admin_router.message(AdminFlow.adding_class, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
 async def adm_add_process(m: Message, state: FSMContext) -> None:
     added, existed, bad = [], [], []
     for token in (t for t in re.split(r"[,;\s]+", m.text) if t):
@@ -1004,7 +1022,8 @@ async def manual_day_view(cls: str, wd: int) -> tuple[str, InlineKeyboardMarkup]
         )
     else:
         text += "Уроков пока нет."
-    rows.append([InlineKeyboardButton(text="➕ Добавить уроки", callback_data=f"madd:{cls}:{wd}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить урок", callback_data=f"madd:{cls}:{wd}")])
+    rows.append([InlineKeyboardButton(text="📝 Добавить списком", callback_data=f"mlist:{cls}:{wd}")])
     rows.append([InlineKeyboardButton(text="⬅️ К дням недели", callback_data=f"mcls:{cls}")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1047,6 +1066,135 @@ async def adm_mday(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
+EXPIRED = "Сессия устарела — откройте /admin и начните заново"
+
+
+async def flow_data(state: FSMContext, *need: str) -> dict | None:
+    """Данные мастера добавления урока; None, если сессия потеряна (например, бот перезапускался)."""
+    data = await state.get_data()
+    return data if all(k in data for k in ("cls", "wd", *need)) else None
+
+
+# ── вариант 1: пошаговое добавление урока (номер → предмет → кабинет → начало → конец) ──
+def numbers_kb(cls: str, wd: int) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(text=str(n), callback_data=f"lno:{n}") for n in range(1, 11)]
+    rows = chunk(buttons, 5)
+    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data=f"mday:{cls}:{wd}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def quick_times(which: str, no: int, start: str | None) -> list[list[tuple[str, str]]]:
+    """Быстрые варианты времени: по звонкам и «начало + 40/45 минут»."""
+    bell = DEFAULT_BELLS.get(no)
+    rows: list[list[tuple[str, str]]] = []
+    if which == "s":
+        if bell:
+            rows.append([(f"✅ По звонкам — {bell[0]}", bell[0])])
+    else:
+        if bell and start and bell[1] > start:
+            rows.append([(f"✅ По звонкам — {bell[1]}", bell[1])])
+        durations = []
+        for n in (40, 45):
+            t = add_minutes(start, n) if start else None
+            if t:
+                durations.append((f"+{n} мин → {t}", t))
+        if durations:
+            rows.append(durations)
+    return rows
+
+
+def hours_kb(which: str, quick: list[list[tuple[str, str]]], cls: str, wd: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"tm:{which}:t:{t.replace(':', '')}") for label, t in row]
+        for row in quick
+    ]
+    hours = [InlineKeyboardButton(text=f"{h:02d}", callback_data=f"tm:{which}:h:{h}") for h in range(7, 19)]
+    rows += chunk(hours, 6)
+    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data=f"mday:{cls}:{wd}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def minutes_kb(which: str, hour: int) -> InlineKeyboardMarkup:
+    minutes = [InlineKeyboardButton(text=f"{hour:02d}:{m:02d}", callback_data=f"tm:{which}:t:{hour:02d}{m:02d}")
+               for m in range(0, 60, 5)]
+    rows = chunk(minutes, 4)
+    rows.append([InlineKeyboardButton(text="⬅️ Другой час", callback_data=f"tm:{which}:b")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lesson_head(which: str, data: dict) -> str:
+    head = (f"Класс <b>{data['cls']}</b>, <b>{WEEKDAYS_SHORT[data['wd']]}</b>, "
+            f"урок №{data['no']} — {html.escape(data['subject'])}")
+    if which == "e":
+        head += f"\nНачало: <b>{data['start']}</b>"
+    return head
+
+
+def time_prompt(which: str, data: dict) -> str:
+    word, example = ("начало", "08:30") if which == "s" else ("конец", "09:15")
+    return (f"{lesson_head(which, data)}\n\nВыберите <b>{word}</b> урока кнопками "
+            f"или отправьте время текстом, например <code>{example}</code>:")
+
+
+async def show_time_step(msg: Message, state: FSMContext, which: str, edit: bool) -> None:
+    data = await state.get_data()
+    await state.set_state(AdminFlow.lesson_start if which == "s" else AdminFlow.lesson_end)
+    text = time_prompt(which, data)
+    kb = hours_kb(which, quick_times(which, data["no"], data.get("start")), data["cls"], data["wd"])
+    if edit:
+        await safe_edit(msg, text, kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
+
+
+async def apply_time(msg: Message, state: FSMContext, which: str, hhmm: str,
+                     edit: bool, cb: CallbackQuery | None = None) -> None:
+    """Применяет выбранное время: начало → переход к концу; конец → сохранение урока."""
+    need = ("no", "subject", "room") + (("start",) if which == "e" else ())
+    data = await flow_data(state, *need)
+    if not data:
+        await state.clear()
+        if cb:
+            await cb.answer(EXPIRED, show_alert=True)
+        else:
+            await msg.answer(EXPIRED)
+        return
+
+    if which == "s":
+        await state.update_data(start=hhmm)
+        await show_time_step(msg, state, "e", edit=edit)
+        if cb:
+            await cb.answer()
+        return
+
+    if hhmm <= data["start"]:
+        warn = f"Конец урока ({hhmm}) должен быть позже начала ({data['start']})"
+        if cb:
+            await cb.answer(warn, show_alert=True)
+        else:
+            await msg.answer(warn + ". Отправьте время конца ещё раз:")
+        return
+
+    cls, wd = data["cls"], data["wd"]
+    added, _ = await add_manual_lessons(cls, wd, [(data["no"], data["start"], hhmm, data["subject"], data["room"])])
+    await state.clear()
+    room = f" (каб. {html.escape(data['room'])})" if data["room"] else ""
+    text = (
+        ("✅ Урок добавлен:" if added else "Такой урок уже есть:")
+        + f"\n<b>{data['no']}.</b> {data['start']}–{hhmm} — {html.escape(data['subject'])}{room}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё урок", callback_data=f"madd:{cls}:{wd}")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data=f"mday:{cls}:{wd}")],
+    ])
+    if edit:
+        await safe_edit(msg, text, kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
+    if cb:
+        await cb.answer()
+
+
 @admin_router.callback_query(F.data.startswith("madd:"))
 async def adm_madd(cb: CallbackQuery, state: FSMContext) -> None:
     parsed = await parse_cls_wd(cb.data)
@@ -1054,14 +1202,138 @@ async def adm_madd(cb: CallbackQuery, state: FSMContext) -> None:
         await cb.answer("Класс не найден — откройте /admin заново", show_alert=True)
         return
     cls, wd = parsed
+    await state.set_state(None)
+    await state.set_data({"cls": cls, "wd": wd})
+    await cb.message.answer(f"Класс <b>{cls}</b>, <b>{WEEKDAYS_FULL[wd]}</b>.\nКакой номер у урока?",
+                            reply_markup=numbers_kb(cls, wd))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("lno:"))
+async def adm_lno(cb: CallbackQuery, state: FSMContext) -> None:
+    data = await flow_data(state)
+    if not data:
+        await cb.answer(EXPIRED, show_alert=True)
+        return
+    try:
+        no = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()
+        return
+    await state.update_data(no=no)
+    await state.set_state(AdminFlow.lesson_subject)
+    await safe_edit(cb.message,
+                    f"Класс <b>{data['cls']}</b>, <b>{WEEKDAYS_FULL[data['wd']]}</b>, урок №{no}.\n"
+                    "Введите название предмета (отмена — /cancel):")
+    await cb.answer()
+
+
+@admin_router.message(AdminFlow.lesson_subject, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
+async def adm_subject(m: Message, state: FSMContext) -> None:
+    if not await flow_data(state, "no"):
+        await state.clear()
+        await m.answer(EXPIRED)
+        return
+    subject = m.text.strip()
+    if len(subject) > 80:
+        await m.answer("Слишком длинное название — не больше 80 символов. Введите ещё раз:")
+        return
+    await state.update_data(subject=subject)
+    await state.set_state(AdminFlow.lesson_room)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Без кабинета", callback_data="lroom:-")]])
+    await m.answer("Введите кабинет или нажмите «Без кабинета»:", reply_markup=kb)
+
+
+@admin_router.message(AdminFlow.lesson_room, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
+async def adm_room_text(m: Message, state: FSMContext) -> None:
+    if not await flow_data(state, "no", "subject"):
+        await state.clear()
+        await m.answer(EXPIRED)
+        return
+    room = m.text.strip()
+    if len(room) > 20:
+        await m.answer("Слишком длинно — кабинет не больше 20 символов. Введите ещё раз:")
+        return
+    await state.update_data(room=room)
+    await show_time_step(m, state, "s", edit=False)
+
+
+@admin_router.callback_query(F.data == "lroom:-")
+async def adm_room_none(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await flow_data(state, "no", "subject"):
+        await cb.answer(EXPIRED, show_alert=True)
+        return
+    await state.update_data(room="")
+    await show_time_step(cb.message, state, "s", edit=True)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("tm:"))
+async def adm_time_cb(cb: CallbackQuery, state: FSMContext) -> None:
+    parts = cb.data.split(":")          # tm:s:h:8 | tm:s:t:0830 | tm:e:b
+    if len(parts) < 3 or parts[1] not in ("s", "e"):
+        await cb.answer()
+        return
+    which, action = parts[1], parts[2]
+    need = ("no", "subject", "room") + (("start",) if which == "e" else ())
+    data = await flow_data(state, *need)
+    if not data:
+        await cb.answer(EXPIRED, show_alert=True)
+        return
+    try:
+        if action == "h":                                   # выбран час → показываем минуты
+            hour = int(parts[3])
+            await safe_edit(cb.message, f"{lesson_head(which, data)}\n\nВыберите минуты:", minutes_kb(which, hour))
+        elif action == "b":                                 # назад к выбору часа
+            await safe_edit(cb.message, time_prompt(which, data),
+                            hours_kb(which, quick_times(which, data["no"], data.get("start")), data["cls"], data["wd"]))
+        elif action == "t":                                 # выбрано время целиком
+            raw = parts[3]
+            hhmm = f"{raw[:2]}:{raw[2:]}"
+            if not re.fullmatch(r"\d{4}", raw) or parse_time(hhmm) is None:
+                await cb.answer()
+                return
+            await apply_time(cb.message, state, which, hhmm, edit=True, cb=cb)
+            return
+    except (IndexError, ValueError):
+        pass
+    await cb.answer()
+
+
+async def time_from_text(m: Message, state: FSMContext, which: str) -> None:
+    hhmm = parse_time(m.text)
+    if not hhmm:
+        await m.answer("Не понял время. Отправьте в формате ЧЧ:ММ, например 08:30")
+        return
+    await apply_time(m, state, which, hhmm, edit=False)
+
+
+@admin_router.message(AdminFlow.lesson_start, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
+async def adm_start_text(m: Message, state: FSMContext) -> None:
+    await time_from_text(m, state, "s")
+
+
+@admin_router.message(AdminFlow.lesson_end, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
+async def adm_end_text(m: Message, state: FSMContext) -> None:
+    await time_from_text(m, state, "e")
+
+
+# ── вариант 2: сразу несколько уроков списком ──
+@admin_router.callback_query(F.data.startswith("mlist:"))
+async def adm_mlist(cb: CallbackQuery, state: FSMContext) -> None:
+    parsed = await parse_cls_wd(cb.data)
+    if not parsed:
+        await cb.answer("Класс не найден — откройте /admin заново", show_alert=True)
+        return
+    cls, wd = parsed
     await state.set_state(AdminFlow.adding_lessons)
-    await state.update_data(cls=cls, wd=wd)
+    await state.set_data({"cls": cls, "wd": wd})
     await cb.message.answer(f"Класс <b>{cls}</b>, <b>{WEEKDAYS_FULL[wd]}</b>.\n\n{MANUAL_HELP}")
     await cb.answer()
 
 
-@admin_router.message(AdminFlow.adding_lessons, F.text, ~F.text.startswith("/"))
-async def adm_madd_process(m: Message, state: FSMContext) -> None:
+@admin_router.message(AdminFlow.adding_lessons, F.text, ~F.text.startswith("/"), F.text.not_in(MENU_TEXTS))
+async def adm_mlist_process(m: Message, state: FSMContext) -> None:
     data = await state.get_data()
     cls, wd = data.get("cls"), data.get("wd")
     if cls is None or wd is None or cls not in await get_classes():
@@ -1147,6 +1419,39 @@ async def keepalive_loop() -> None:
                 logging.warning("Keep-alive не удался: %s", e)
 
 
+class ConflictLogHandler(logging.Handler):
+    """Замечает сообщение aiogram о том, что этот же токен одновременно использует другой экземпляр бота."""
+
+    def __init__(self, event: asyncio.Event) -> None:
+        super().__init__(level=logging.ERROR)
+        self.event = event
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return
+        if "Conflict" in msg and "getUpdates" in msg:
+            self.event.set()
+
+
+async def conflict_watcher(bot: Bot, event: asyncio.Event) -> None:
+    while True:
+        await event.wait()
+        event.clear()
+        logging.error("Обнаружен второй запущенный экземпляр бота с тем же токеном!")
+        for admin_id in ADMIN_IDS:
+            with suppress(Exception):
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ Экземпляр #{INSTANCE_ID} обнаружил, что этот же бот запущен где-то ещё "
+                    "(конфликт getUpdates). Из-за этого кнопки срабатывают через раз, а классы «пропадают»: "
+                    "два запущенных бота обрабатывают сообщения по очереди.\n"
+                    "Остановите лишний: бота на компьютере, второй сервис или старый деплой на Render.",
+                )
+        await asyncio.sleep(1800)   # не чаще раза в 30 минут
+
+
 # ════════════════════════════ ЗАПУСК ════════════════════════════
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1160,6 +1465,10 @@ async def main() -> None:
                  "PostgreSQL" if _pg_pool is not None else f"SQLite ({DB_PATH})", len(await get_classes()))
     if warning := storage_warning():
         logging.warning(warning)
+
+    logging.info("Запущен экземпляр бота #%s", INSTANCE_ID)
+    conflict_event = asyncio.Event()
+    logging.getLogger().addHandler(ConflictLogHandler(conflict_event))
 
     runner = await start_health_server()
 
@@ -1175,7 +1484,7 @@ async def main() -> None:
         BotCommand(command="tomorrow", description="Расписание на завтра"),
     ])
 
-    background: list[asyncio.Task] = []
+    background: list[asyncio.Task] = [asyncio.create_task(conflict_watcher(bot, conflict_event))]
     if SHEET_ID:
         logging.info("Первичная синхронизация: %s", await safe_sync())
         if SYNC_INTERVAL_MIN > 0:
